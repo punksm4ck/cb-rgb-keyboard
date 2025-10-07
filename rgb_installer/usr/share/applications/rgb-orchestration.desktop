@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=RGB Orchestration
+Exec=rgbgui
+Icon=utilities-terminal
+Type=Application
+Categories=Utility;

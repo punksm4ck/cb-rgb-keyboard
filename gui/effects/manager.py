@@ -1,384 +1,494 @@
 #!/usr/bin/env python3
-"""Effect Manager for RGB Keyboard Effects - Fixed Version with Proper Hardware Status Communication"""
+"""Enhanced Effects Manager with OSIRIS optimization and comprehensive effect management"""
 
-import logging
 import threading
 import time
-from typing import Callable, Dict, Any, Optional, List
+import logging
+from typing import Dict, Any, Optional, List, Callable
+import queue
 
-from ..core.rgb_color import RGBColor
-from ..core.constants import default_settings, NUM_ZONES
-from ..hardware.controller import HardwareController
-from .library import EffectLibrary, AVAILABLE_EFFECTS
+from ..core.rgb_color import RGBColor, Colors
+from ..core.constants import NUM_ZONES, ANIMATION_FRAME_DELAY
+from ..core.exceptions import EffectError, HardwareError
+from ..utils.decorators import safe_execute, thread_safe, performance_monitor
+from ..utils.input_validation import SafeInputValidation
+from .library import BaseEffect, EffectLibrary, effect_library
+
 
 class EffectManager:
-    """Manages the execution of RGB keyboard effects from EffectLibrary."""
-    
-    def __init__(self, logger, hardware_controller, settings_manager):
-        self.logger = logger.getChild('EffectManager')
+    """
+    Enhanced Effects Manager with hardware integration and OSIRIS optimization
+
+    Manages effect execution, transitions, and hardware communication with
+    thread-safe operations and comprehensive error handling.
+    """
+
+    def __init__(self, hardware_controller=None, parent_logger=None):
+        """
+        Initialize effect manager
+
+        Args:
+            hardware_controller: Hardware controller instance
+            parent_logger: Parent logger instance
+        """
+        self.logger = (parent_logger.getChild('EffectManager')
+                      if parent_logger else logging.getLogger('EffectManager'))
+
         self.hardware = hardware_controller
-        self.settings = settings_manager
-        self.current_effect_name: Optional[str] = None
+        self._lock = threading.RLock()
+
+        # Effect management
+        self.current_effect: Optional[BaseEffect] = None
         self.effect_thread: Optional[threading.Thread] = None
-        self.stop_event = threading.Event()
-        self.current_effect_params: Dict[str, Any] = {}
-        self._is_effect_running_flag = False 
+        self._stop_event = threading.Event()
+        self._pause_event = threading.Event()
 
-        # Map effect names to library functions
-        self.effect_map: Dict[str, Callable] = {
-            "Static Color": self._apply_static_color,
-            "Static Zone Colors": self._apply_static_zone_colors,
-            "Static Rainbow": self._apply_static_rainbow,
-            "Static Gradient": self._apply_static_gradient,
-            "Breathing": EffectLibrary.breathing,
-            "Color Cycle": EffectLibrary.color_cycle,
-            "Wave": EffectLibrary.wave,
-            "Rainbow Wave": EffectLibrary.rainbow_wave,
-            "Pulse": EffectLibrary.pulse,
-            "Zone Chase": EffectLibrary.zone_chase,
-            "Starlight": EffectLibrary.starlight,
-            "Raindrop": EffectLibrary.raindrop, 
-            "Scanner": EffectLibrary.scanner,   
-            "Strobe": EffectLibrary.strobe,     
-            "Ripple": EffectLibrary.ripple,     
-            "Rainbow Breathing": EffectLibrary.rainbow_breathing,
-            "Rainbow Zones Cycle": EffectLibrary.rainbow_zones_cycle,
-            "Reactive": EffectLibrary.reactive,
-            "Anti-Reactive": EffectLibrary.anti_reactive,
-        }
-        self.logger.info("EffectManager initialized with %d effects mapped.", len(self.effect_map))
+        # Frame management
+        self._frame_queue = queue.Queue(maxsize=60)  # Buffer for 60 frames
+        self._frame_counter = 0
+        self._effect_start_time = 0.0
 
-    
-    def get_available_effects(self):
-        """Get list of all available effect names"""
-        try:
-            return list(self.effect_map.keys())
-        except:
-            # Fallback list
-            return ["Breathing", "Wave", "Pulse", "Reactive", "Anti-Reactive"]
+        # Performance tracking
+        self._frame_times = []
+        self._max_frame_time_samples = 100
 
-    def _apply_static_color(self, **kwargs):
-        """Apply static color to all zones"""
-        color = kwargs.get('color', RGBColor(255, 255, 255))
-        if isinstance(color, str):
-            color = RGBColor.from_hex(color)
-        elif isinstance(color, dict):
-            color = RGBColor.from_dict(color)
-        
-        success = self.hardware.set_all_leds_color(color)
-        if success:
-            self.logger.info(f"Applied static color {color.to_hex()} to all zones")
-        else:
-            self.logger.error(f"Failed to apply static color {color.to_hex()}")
-        return success
+        # OSIRIS optimization
+        self.osiris_mode = False
+        self.single_zone_hardware = False
 
-    def _apply_static_zone_colors(self, **kwargs):
-        """Apply individual colors to each zone"""
-        zone_colors = kwargs.get('zone_colors', [RGBColor(255, 0, 0), RGBColor(0, 255, 0), RGBColor(0, 0, 255), RGBColor(255, 255, 0)])
-        
-        # Ensure we have the right number of colors
-        if len(zone_colors) < NUM_ZONES:
-            # Extend with default colors
-            default_colors = [RGBColor(255, 0, 0), RGBColor(0, 255, 0), RGBColor(0, 0, 255), RGBColor(255, 255, 0)]
-            while len(zone_colors) < NUM_ZONES:
-                zone_colors.append(default_colors[len(zone_colors) % len(default_colors)])
-        
-        zone_colors = zone_colors[:NUM_ZONES]  # Trim to correct size
-        
-        # Convert any non-RGBColor objects
-        for i, color in enumerate(zone_colors):
-            if isinstance(color, str):
-                zone_colors[i] = RGBColor.from_hex(color)
-            elif isinstance(color, dict):
-                zone_colors[i] = RGBColor.from_dict(color)
-        
-        success = self.hardware.set_zone_colors(zone_colors)
-        if success:
-            self.logger.info("Applied individual zone colors")
-        else:
-            self.logger.error("Failed to apply zone colors")
-        return success
+        # State management
+        self.is_running = False
+        self.last_colors = [Colors.BLACK] * NUM_ZONES
 
-    def _apply_static_rainbow(self, **kwargs):
-        """Apply rainbow pattern across zones"""
-        import colorsys
-        zone_colors = []
-        for i in range(NUM_ZONES):
-            hue = i / NUM_ZONES
-            rgb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-            zone_colors.append(RGBColor(int(rgb[0] * 255), int(rgb[1] * 255), int(rgb[2] * 255)))
-        
-        success = self.hardware.set_zone_colors(zone_colors)
-        if success:
-            self.logger.info("Applied static rainbow pattern")
-        else:
-            self.logger.error("Failed to apply static rainbow")
-        return success
+        self.logger.info("Effect Manager initialized")
 
-    def _apply_static_gradient(self, **kwargs):
-        """Apply gradient pattern across zones"""
-        start_color = kwargs.get('start_color', RGBColor(255, 0, 0))
-        end_color = kwargs.get('end_color', RGBColor(0, 0, 255))
-        
-        if isinstance(start_color, str):
-            start_color = RGBColor.from_hex(start_color)
-        elif isinstance(start_color, dict):
-            start_color = RGBColor.from_dict(start_color)
-            
-        if isinstance(end_color, str):
-            end_color = RGBColor.from_hex(end_color)
-        elif isinstance(end_color, dict):
-            end_color = RGBColor.from_dict(end_color)
-        
-        zone_colors = []
-        for i in range(NUM_ZONES):
-            if NUM_ZONES > 1:
-                ratio = i / (NUM_ZONES - 1)
-            else:
-                ratio = 0
-            
-            # Interpolate between start and end colors
-            r = int(start_color.r * (1 - ratio) + end_color.r * ratio)
-            g = int(start_color.g * (1 - ratio) + end_color.g * ratio)
-            b = int(start_color.b * (1 - ratio) + end_color.b * ratio)
-            zone_colors.append(RGBColor(r, g, b))
-        
-        success = self.hardware.set_zone_colors(zone_colors)
-        if success:
-            self.logger.info(f"Applied static gradient from {start_color.to_hex()} to {end_color.to_hex()}")
-        else:
-            self.logger.error("Failed to apply static gradient")
-        return success
+    def set_hardware_controller(self, hardware_controller):
+        """Set or update hardware controller"""
+        with self._lock:
+            self.hardware = hardware_controller
 
-    def effect_supports_rainbow(self, effect_name: str) -> bool:
-        """Check if effect supports rainbow mode"""
-        rainbow_capable_by_param = [
-            "Breathing", "Wave", "Pulse", "Zone Chase", "Starlight", 
-            "Scanner", "Strobe", "Ripple", "Reactive", "Anti-Reactive"
-        ]
-        inherently_rainbow = ["Color Cycle", "Rainbow Wave", "Rainbow Breathing", "Rainbow Zones Cycle"]
-        return effect_name in rainbow_capable_by_param or effect_name in inherently_rainbow
+            # Detect OSIRIS hardware
+            if hasattr(self.hardware, 'is_osiris_hardware'):
+                self.osiris_mode = getattr(self.hardware, 'is_osiris_hardware', False)
+                self.single_zone_hardware = self.osiris_mode
 
-    def start_effect(self, effect_name: str, **params: Any) -> bool:
-        """Start an effect with given parameters - implements Goal 2A hardware status communication"""
-        if effect_name == "None" or effect_name is None:
-            self.stop_current_effect()
-            if self.hardware: 
-                self.hardware.clear_all_leds() 
-            return True
+                if self.osiris_mode:
+                    self.logger.info("OSIRIS hardware detected - enabling optimizations")
 
-        if effect_name not in self.effect_map:
-            self.logger.error(f"Effect '{effect_name}' not found in effect map.")
-            return False
+    @safe_execute(max_attempts=2, severity="error")
+    def start_effect(self, effect_name: str, **kwargs) -> bool:
+        """
+        Start a lighting effect
 
-        # Stop any currently running effect
-        self.stop_current_effect()
-        
-        # Wait for hardware to be ready
-        if not self.hardware.wait_for_detection(timeout=2.0):
-            self.logger.error("Hardware not ready for effect")
-            return False
-        
-        self.current_effect_name = effect_name
-        self.current_effect_params = params.copy()
-        self.stop_event.clear()
-        
-        effect_func = self.effect_map[effect_name]
-        
-        # Static effects are applied immediately
-        static_effects = ["Static Color", "Static Zone Colors", "Static Rainbow", "Static Gradient"]
+        Args:
+            effect_name: Name of effect to start
+            **kwargs: Effect parameters
 
-        if effect_name in static_effects:
-            self.logger.info(f"Applying static effect: {effect_name} with params: {params}")
+        Returns:
+            bool: True if effect started successfully
+        """
+        with self._lock:
             try:
-                success = effect_func(**params)
-                # Static effects don't continuously run, so don't mark as "effect running"
-                self.current_effect_name = None 
-                self.current_effect_params = {}
-                self._is_effect_running_flag = False
-                # Ensure hardware controller knows no continuous effect is running
-                if hasattr(self.hardware, 'set_effect_running_status'):
-                    self.hardware.set_effect_running_status(False)
-                return success
-            except Exception as e:
-                self.logger.error(f"Error applying static effect '{effect_name}': {e}", exc_info=True)
-                return False
+                # Stop current effect if running
+                if self.is_running:
+                    self.stop_effect()
 
-        # Handle reactive effects specially
-        if effect_name in ["Reactive", "Anti-Reactive"]:
-            self.logger.info(f"Starting reactive effect: {effect_name}")
-            
-            # Stop any existing effects first
-            self.stop_current_effect()
-            
-            # Enable reactive mode on hardware
-            anti_mode = effect_name == "Anti-Reactive"
-            if hasattr(self.hardware, 'set_reactive_mode'):
-                success = self.hardware.set_reactive_mode(
-                    enabled=True,
-                    color=params.get('color', RGBColor(255, 255, 255)),
-                    anti_mode=anti_mode
+                # Create new effect
+                if self.osiris_mode:
+                    kwargs['osiris_optimized'] = True
+                    kwargs['single_zone_hardware'] = True
+
+                self.current_effect = effect_library.create_effect(effect_name, **kwargs)
+
+                # Reset state
+                self._stop_event.clear()
+                self._pause_event.clear()
+                self._frame_counter = 0
+                self._effect_start_time = time.time()
+
+                # Start effect execution thread
+                self.effect_thread = threading.Thread(
+                    target=self._effect_loop,
+                    name=f"Effect-{effect_name}",
+                    daemon=True
                 )
-                
-                if success:
-                    self.current_effect_name = effect_name
-                    self.current_effect_params = params.copy()
-                    self._is_effect_running_flag = True
-                    
-                    # Inform hardware controller that an effect is running
-                    if hasattr(self.hardware, 'set_effect_running_status'):
-                        self.hardware.set_effect_running_status(True)
-                    
-                    # Start simulation for testing
-                    if params.get('simulate_keys', False):
-                        threading.Thread(
-                            target=self._run_reactive_simulation,
-                            args=(effect_name,),
-                            daemon=True,
-                            name=f"ReactiveSimulation-{effect_name}"
-                        ).start()
-                    
-                    return True
-                else:
-                    self.logger.error(f"Failed to enable reactive mode for {effect_name}")
-                    return False
-            else:
-                self.logger.warning("Hardware does not support reactive mode")
-                return False
-        else: 
-            # Animated effects run in a thread - this is where Goal 2A is crucial
-            self.logger.info(f"Starting animated effect: {effect_name} with params: {params}")
-            
-            # Prepare parameters for the effect function
-            thread_kwargs = params.copy()
-            if 'speed' not in thread_kwargs: 
-                thread_kwargs['speed'] = 5 
-            if not thread_kwargs.get('rainbow_mode', False) and 'color' not in thread_kwargs:
-                default_color_hex = default_settings.get('effect_color', "#FFFFFF")
-                thread_kwargs['color'] = RGBColor.from_hex(default_color_hex)
 
-            # Create and start the effect thread
-            self.effect_thread = threading.Thread(
-                target=self._run_animated_effect, 
-                args=(effect_func, thread_kwargs),
-                daemon=True,
-                name=f"EffectThread-{effect_name}"
-            )
-            
-            try:
+                self.current_effect.start()
                 self.effect_thread.start()
-                self._is_effect_running_flag = True
-                # CRITICAL for Goal 2A: Inform hardware controller that an effect is running
-                # This prevents LED clearing when GUI is hidden to tray
-                if hasattr(self.hardware, 'set_effect_running_status'):
-                    self.hardware.set_effect_running_status(True)
-                    self.logger.debug(f"Informed hardware controller that effect '{effect_name}' is running")
+                self.is_running = True
+
+                self.logger.info(f"Started effect: {effect_name}")
                 return True
+
             except Exception as e:
-                 self.logger.error(f"Failed to start thread for effect '{effect_name}': {e}", exc_info=True)
-                 self.current_effect_name = None
-                 self._is_effect_running_flag = False
-                 if hasattr(self.hardware, 'set_effect_running_status'):
-                     self.hardware.set_effect_running_status(False)
-                 return False
+                self.logger.error(f"Failed to start effect '{effect_name}': {e}")
+                self.current_effect = None
+                return False
 
-    def _run_animated_effect(self, effect_func: Callable, params: Dict[str, Any]):
-        """Run an animated effect in a thread"""
-        try:
-            self.logger.info(f"Starting animated effect thread with params: {params}")
-            effect_func(self.stop_event, self.hardware, **params)
-        except Exception as e:
-            self.logger.error(f"Error in animated effect: {e}", exc_info=True)
-        finally:
-            self.logger.info("Animated effect thread finished")
-            self._is_effect_running_flag = False
-            # CRITICAL for Goal 2A: Inform hardware controller that effect has stopped
-            if hasattr(self.hardware, 'set_effect_running_status'):
-                self.hardware.set_effect_running_status(False)
-                self.logger.debug("Informed hardware controller that effect has stopped")
+    @safe_execute(max_attempts=1, severity="warning")
+    def stop_effect(self) -> bool:
+        """
+        Stop the current effect
 
-    def stop_current_effect(self) -> None:
-        """Stop the currently running effect - implements Goal 2A hardware status communication"""
-        if self.effect_thread and self.effect_thread.is_alive():
-            self.logger.info(f"Stopping current effect: {self.current_effect_name}")
-            self.stop_event.set()
+        Returns:
+            bool: True if stopped successfully
+        """
+        with self._lock:
+            if not self.is_running:
+                return True
+
             try:
-                self.effect_thread.join(timeout=2.0)  # Increased timeout
-                if self.effect_thread.is_alive():
-                    self.logger.warning(f"Effect thread for '{self.current_effect_name}' did not join cleanly.")
+                # Signal stop
+                self._stop_event.set()
+                self.is_running = False
+
+                # Stop current effect
+                if self.current_effect:
+                    self.current_effect.stop()
+
+                # Wait for thread to finish
+                if self.effect_thread and self.effect_thread.is_alive():
+                    self.effect_thread.join(timeout=2.0)
+                    if self.effect_thread.is_alive():
+                        self.logger.warning("Effect thread did not stop gracefully")
+
+                # Clear hardware
+                if self.hardware and self.hardware.is_operational():
+                    self.hardware.clear_all_leds()
+
+                self.current_effect = None
+                self.effect_thread = None
+                self.last_colors = [Colors.BLACK] * NUM_ZONES
+
+                self.logger.info("Effect stopped")
+                return True
+
             except Exception as e:
-                self.logger.error(f"Error joining effect thread: {e}", exc_info=True)
-        
-        self.effect_thread = None
-        # Stop reactive mode if active
-        if self.current_effect_name in ["Reactive", "Anti-Reactive"]:
-            if hasattr(self.hardware, 'set_reactive_mode'):
-                self.hardware.set_reactive_mode(enabled=False, color=RGBColor(0, 0, 0))
-        
-        self.current_effect_name = None 
-        self.current_effect_params = {}
-        self._is_effect_running_flag = False
-        # CRITICAL for Goal 2A: Always inform hardware controller when stopping effects
-        if hasattr(self.hardware, 'set_effect_running_status'):
-            self.hardware.set_effect_running_status(False)
-            self.logger.debug("Informed hardware controller that no effect is running")
+                self.logger.error(f"Error stopping effect: {e}")
+                return False
 
-    def is_effect_running(self) -> bool:
-        """Check if an effect is currently running"""
-        return self._is_effect_running_flag and bool(self.effect_thread and self.effect_thread.is_alive())
+    def pause_effect(self) -> bool:
+        """Pause the current effect"""
+        with self._lock:
+            if self.current_effect and self.is_running:
+                self._pause_event.set()
+                self.current_effect.pause()
+                self.logger.info("Effect paused")
+                return True
+            return False
 
-    def update_effect_speed(self, new_speed: int):
-        """Update the speed of the currently running effect"""
-        if self.is_effect_running() and self.current_effect_name:
-            validated_speed = max(1, min(10, new_speed))
-            self.logger.info(f"Updating speed for effect '{self.current_effect_name}' to {validated_speed}.")
-            updated_params = self.current_effect_params.copy()
-            updated_params["speed"] = validated_speed
-            self.start_effect(self.current_effect_name, **updated_params)
-        else:
-            self.logger.debug("No effect running or name unknown, cannot update speed.")
+    def resume_effect(self) -> bool:
+        """Resume the paused effect"""
+        with self._lock:
+            if self.current_effect and self.is_running:
+                self._pause_event.clear()
+                self.current_effect.resume()
+                self.logger.info("Effect resumed")
+                return True
+            return False
 
-    def update_effect_color(self, new_color: RGBColor):
-        """Update the color of the currently running effect"""
-        if self.is_effect_running() and self.current_effect_name and \
-           not self.current_effect_params.get("rainbow_mode", False):
-            
-            self.logger.info(f"Updating color for effect '{self.current_effect_name}' to {new_color.to_hex()}.")
-            updated_params = self.current_effect_params.copy()
-            updated_params["color"] = new_color
-            self.start_effect(self.current_effect_name, **updated_params)
-        else:
-            self.logger.debug("Cannot update color: No effect running, is in rainbow mode, or effect doesn't use single color.")
-
-    def _run_reactive_simulation(self, effect_name: str):
-        """Run reactive effect simulation for testing"""
-        self.logger.info(f"Starting reactive simulation for {effect_name}")
-        
+    @performance_monitor(log_performance=False, performance_threshold=0.1)
+    def _effect_loop(self):
+        """Main effect execution loop"""
         try:
-            while self._is_effect_running_flag and self.current_effect_name == effect_name:
-                if hasattr(self.hardware, 'simulate_key_press_pattern'):
-                    self.hardware.simulate_key_press_pattern("typing")
-                time.sleep(2.0)  # Repeat every 2 seconds
+            while not self._stop_event.is_set() and self.current_effect:
+                loop_start = time.time()
+
+                # Check if paused
+                if self._pause_event.is_set():
+                    time.sleep(0.1)
+                    continue
+
+                try:
+                    # Generate frame
+                    frame_colors = self.current_effect.generate_frame(self._frame_counter)
+
+                    if frame_colors:
+                        # Apply OSIRIS optimizations if needed
+                        if self.osiris_mode:
+                            frame_colors = self._optimize_for_osiris(frame_colors)
+
+                        # Send to hardware
+                        success = self._send_colors_to_hardware(frame_colors)
+
+                        if success:
+                            self.last_colors = frame_colors.copy()
+
+                    self._frame_counter += 1
+
+                    # Calculate timing
+                    loop_time = time.time() - loop_start
+                    self._track_performance(loop_time)
+
+                    # Sleep for appropriate delay
+                    delay = self.current_effect.get_delay()
+                    remaining_time = delay - loop_time
+                    if remaining_time > 0:
+                        time.sleep(remaining_time)
+
+                except Exception as e:
+                    self.logger.error(f"Error in effect loop: {e}")
+                    time.sleep(0.1)  # Prevent tight error loop
+
         except Exception as e:
-            self.logger.error(f"Error in reactive simulation: {e}")
+            self.logger.error(f"Critical error in effect loop: {e}")
+
         finally:
-            self.logger.info("Reactive simulation ended")
+            self.logger.debug("Effect loop terminated")
 
-    def toggle_effect_rainbow_mode(self, rainbow_on: bool):
-        """Toggle rainbow mode for the currently running effect"""
-        if self.is_effect_running() and self.current_effect_name and \
-           self.effect_supports_rainbow(self.current_effect_name):
-            
-            self.logger.info(f"Toggling rainbow mode to {rainbow_on} for effect '{self.current_effect_name}'.")
-            updated_params = self.current_effect_params.copy()
-            updated_params["rainbow_mode"] = rainbow_on
-            
-            if not rainbow_on and "color" not in updated_params:
-                default_color_hex = default_settings.get('effect_color', "#FFFFFF")
-                # Use the color that was active before rainbow mode, or default
-                fallback_color_hex = self.current_effect_params.get("color_fallback_hex", default_color_hex)
-                updated_params["color"] = RGBColor.from_hex(fallback_color_hex)
+    def _optimize_for_osiris(self, colors: List[RGBColor]) -> List[RGBColor]:
+        """
+        Optimize colors for OSIRIS single-zone hardware
 
-            self.start_effect(self.current_effect_name, **updated_params)
-        else:
-            self.logger.debug("Cannot toggle rainbow: No effect running or effect does not support rainbow mode.")
+        Args:
+            colors: List of zone colors
+
+        Returns:
+            List[RGBColor]: Optimized colors
+        """
+        if not colors:
+            return colors
+
+        if len(colors) == 1:
+            return colors
+
+        # For OSIRIS, convert multiple colors to optimal single color
+        from ..core.rgb_color import get_optimal_osiris_brightness
+
+        # Calculate optimal brightness
+        optimal_brightness = get_optimal_osiris_brightness(colors, method="weighted_average")
+
+        # Create equivalent white color at optimal brightness
+        optimized_color = RGBColor.from_brightness(optimal_brightness, "neutral")
+
+        # Return single color for all zones
+        return [optimized_color] * NUM_ZONES
+
+    @safe_execute(max_attempts=2, severity="warning", fallback_return=False)
+    def _send_colors_to_hardware(self, colors: List[RGBColor]) -> bool:
+        """
+        Send colors to hardware with error handling
+
+        Args:
+            colors: List of colors to send
+
+        Returns:
+            bool: True if successful
+        """
+        if not self.hardware or not self.hardware.is_operational():
+            return False
+
+        try:
+            if len(colors) == 1:
+                # Single color for all zones
+                return self.hardware.set_all_leds_color(colors[0])
+            else:
+                # Multiple zone colors
+                return self.hardware.set_zone_colors(colors)
+
+        except HardwareError as e:
+            self.logger.warning(f"Hardware error sending colors: {e}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Unexpected error sending colors: {e}")
+            return False
+
+    def _track_performance(self, frame_time: float):
+        """Track performance metrics"""
+        self._frame_times.append(frame_time)
+
+        # Keep only recent samples
+        if len(self._frame_times) > self._max_frame_time_samples:
+            self._frame_times.pop(0)
+
+        # Log performance warnings
+        if frame_time > 0.1:  # 100ms is too slow
+            self.logger.warning(f"Slow frame render: {frame_time:.3f}s")
+
+    def get_performance_stats(self) -> Dict[str, float]:
+        """Get performance statistics"""
+        if not self._frame_times:
+            return {}
+
+        return {
+            'avg_frame_time': sum(self._frame_times) / len(self._frame_times),
+            'max_frame_time': max(self._frame_times),
+            'min_frame_time': min(self._frame_times),
+            'frame_count': len(self._frame_times),
+            'estimated_fps': 1.0 / (sum(self._frame_times) / len(self._frame_times))
+        }
+
+    def get_current_effect_info(self) -> Optional[Dict[str, Any]]:
+        """Get information about current effect"""
+        with self._lock:
+            if self.current_effect:
+                info = self.current_effect.get_info()
+                info.update({
+                    'manager_frame_counter': self._frame_counter,
+                    'runtime': time.time() - self._effect_start_time,
+                    'is_paused': self._pause_event.is_set(),
+                    'performance_stats': self.get_performance_stats()
+                })
+                return info
+            return None
+
+    def set_static_color(self, color: RGBColor) -> bool:
+        """
+        Set static color (shortcut method)
+
+        Args:
+            color: Color to set
+
+        Returns:
+            bool: True if successful
+        """
+        return self.start_effect("Static Color", color=color)
+
+    def set_static_brightness(self, brightness: int) -> bool:
+        """
+        Set static brightness (OSIRIS optimized)
+
+        Args:
+            brightness: Brightness level (0-100)
+
+        Returns:
+            bool: True if successful
+        """
+        if not self.hardware or not self.hardware.is_operational():
+            return False
+
+        try:
+            return self.hardware.set_brightness(brightness)
+        except Exception as e:
+            self.logger.error(f"Failed to set brightness: {e}")
+            return False
+
+    def trigger_reactive(self, zone: int = 0):
+        """
+        Trigger reactive effect on specific zone
+
+        Args:
+            zone: Zone to trigger (0-based)
+        """
+        with self._lock:
+            if (self.current_effect and
+                hasattr(self.current_effect, 'trigger_zone') and
+                self.current_effect.name == "Reactive"):
+
+                self.current_effect.trigger_zone(zone)
+                self.logger.debug(f"Triggered reactive effect on zone {zone}")
+
+    def apply_instant_color(self, colors: List[RGBColor], duration: float = 0.0) -> bool:
+        """
+        Apply colors instantly without starting an effect
+
+        Args:
+            colors: Colors to apply
+            duration: Duration to show colors (0 for permanent)
+
+        Returns:
+            bool: True if successful
+        """
+        if not self.hardware or not self.hardware.is_operational():
+            return False
+
+        try:
+            # Apply OSIRIS optimization if needed
+            if self.osiris_mode:
+                colors = self._optimize_for_osiris(colors)
+
+            success = self._send_colors_to_hardware(colors)
+
+            if success and duration > 0:
+                # Schedule return to previous state
+                def restore_previous():
+                    time.sleep(duration)
+                    self._send_colors_to_hardware(self.last_colors)
+
+                restore_thread = threading.Thread(target=restore_previous, daemon=True)
+                restore_thread.start()
+
+            return success
+
+        except Exception as e:
+            self.logger.error(f"Failed to apply instant color: {e}")
+            return False
+
+    def get_available_effects(self) -> List[str]:
+        """Get list of available effects"""
+        effects = effect_library.get_available_effects()
+
+        # Filter for OSIRIS if needed
+        if self.osiris_mode:
+            from .library import get_osiris_recommended_effects
+            recommended = get_osiris_recommended_effects()
+            return [effect for effect in effects if effect in recommended] + \
+                   [effect for effect in effects if effect not in recommended]
+
+        return effects
+
+    def cleanup(self):
+        """Cleanup effect manager resources"""
+        self.logger.info("Cleaning up Effect Manager...")
+
+        try:
+            self.stop_effect()
+
+            # Clear any remaining frame queue
+            while not self._frame_queue.empty():
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+            self.logger.info("Effect Manager cleanup completed")
+
+        except Exception as e:
+            self.logger.error(f"Error during Effect Manager cleanup: {e}")
+
+    def __del__(self):
+        """Destructor"""
+        try:
+            self.cleanup()
+        except:
+            pass
+
+
+# Convenience functions for common operations
+def create_effect_manager(hardware_controller=None, logger=None) -> EffectManager:
+    """Create effect manager instance"""
+    return EffectManager(hardware_controller, logger)
+
+
+def get_recommended_effects_for_hardware(is_osiris: bool = False) -> List[str]:
+    """Get recommended effects for specific hardware"""
+    if is_osiris:
+        from .library import get_osiris_recommended_effects
+        return get_osiris_recommended_effects()
+    else:
+        return effect_library.get_available_effects()
+
+
+def validate_effect_parameters(effect_name: str, **kwargs) -> Dict[str, Any]:
+    """Validate effect parameters"""
+    validated = {}
+
+    # Common parameter validation
+    if 'speed' in kwargs:
+        validated['speed'] = SafeInputValidation.validate_speed(kwargs['speed'], default=5)
+
+    if 'brightness' in kwargs:
+        validated['brightness'] = SafeInputValidation.validate_brightness(kwargs['brightness'], default=100)
+
+    if 'color' in kwargs:
+        validated['color'] = SafeInputValidation.validate_color(kwargs['color'], default=Colors.WHITE)
+
+    if 'colors' in kwargs:
+        validated['colors'] = SafeInputValidation.validate_color_list(kwargs['colors'])
+
+    # Add other parameters as-is
+    for key, value in kwargs.items():
+        if key not in validated:
+            validated[key] = value
+
+    return validated

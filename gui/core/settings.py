@@ -1,242 +1,537 @@
 #!/usr/bin/env python3
-"""Settings management system for RGB Controller"""
+"""Enhanced Settings Manager with OSIRIS optimization and comprehensive validation"""
 
 import json
-import threading
 import logging
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-import shutil
+import threading
 import time
-import os
+from pathlib import Path
+from typing import Any, Dict, Optional, Union, List
+from datetime import datetime
 
+from .constants import default_settings, SETTINGS_FILE, BACKUP_DIR
+from .exceptions import ConfigurationError
 from .rgb_color import RGBColor
-from .constants import SETTINGS_FILE, default_settings, NUM_ZONES
-from .exceptions import ConfigurationError, ValidationError
-
-from ..utils.decorators import safe_execute
-from ..utils.input_validation import SafeInputValidation
-
-def get_fresh_default_settings() -> Dict[str, Any]:
-    """Returns a deep copy of the default settings dictionary."""
-    return json.loads(json.dumps(default_settings))
 
 
 class SettingsManager:
     """
-    Manages application settings with validation, loading, and atomic saving.
-    Uses default_settings from constants.py as a schema and fallback.
+    Enhanced Settings Manager with thread-safe operations, validation, and backup support
+
+    Provides comprehensive settings management for the Enhanced RGB Controller with
+    OSIRIS-specific optimizations, automatic backup, and validation.
     """
 
-    def __init__(self, config_file_path: Optional[Path] = None):
-        self.logger = logging.getLogger('SettingsManager')
+    def __init__(self, settings_file: Optional[Path] = None):
+        """
+        Initialize the Settings Manager
 
-        if config_file_path is None:
-            self.config_file = SETTINGS_FILE
-        else:
-            self.config_file = Path(config_file_path).resolve()
-
+        Args:
+            settings_file: Optional custom settings file path
+        """
+        self.settings_file = settings_file or SETTINGS_FILE
+        self.backup_dir = BACKUP_DIR
         self._lock = threading.RLock()
-        self._settings: Dict[str, Any] = get_fresh_default_settings()
-        self._last_session_clean_shutdown = False # Stored state from previous session
+        self._settings: Dict[str, Any] = {}
+        self._dirty = False
+        self._last_save_time = 0.0
+        self._auto_save_delay = 2.0  # Auto-save delay in seconds
+        self._auto_save_timer: Optional[threading.Timer] = None
 
-        self.load_settings()
+        # Setup logging
+        self.logger = logging.getLogger(f"SettingsManager")
 
-    @safe_execute(severity="critical", max_attempts=1)
-    def load_settings(self) -> None:
-        with self._lock:
-            loaded_successfully = False
-            if self.config_file.exists() and self.config_file.is_file() and self.config_file.stat().st_size > 0:
-                try:
-                    with open(self.config_file, 'r', encoding='utf-8') as f:
-                        loaded_data = json.load(f)
+        # Ensure directories exist
+        self._ensure_directories()
 
-                    if not isinstance(loaded_data, dict):
-                        raise ConfigurationError("Settings file root is not a dictionary.")
+        # Load settings
+        self._load_settings()
 
-                    temp_settings = get_fresh_default_settings()
-                    for key, default_val_from_schema in temp_settings.items():
-                        if key in loaded_data:
-                            temp_settings[key] = self._validate_setting_value(key, loaded_data[key], default_val_from_schema)
+        # Track session state
+        self._session_start_time = time.time()
+        self._session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-                    self._settings = temp_settings
-                    # Capture the clean_shutdown status from the loaded settings
-                    self._last_session_clean_shutdown = SafeInputValidation.validate_bool(self._settings.get("clean_shutdown", False))
-                    loaded_successfully = True
-                    self.logger.info(f"Settings loaded from {self.config_file}. Previous shutdown was {'clean' if self._last_session_clean_shutdown else 'unclean/first run'}.")
-
-                except json.JSONDecodeError as e:
-                    self.logger.error(f"JSON decoding error in {self.config_file}: {e}. Attempting recovery.", exc_info=True)
-                except ConfigurationError as e:
-                    self.logger.error(f"Configuration error loading settings: {e}. Attempting recovery.", exc_info=True)
-                except Exception as e:
-                    self.logger.error(f"Unexpected error loading settings from {self.config_file}: {e}. Attempting recovery.", exc_info=True)
-            else:
-                self.logger.info(f"Settings file {self.config_file} not found or empty. Initializing with defaults.")
-
-            if not loaded_successfully:
-                self._attempt_settings_recovery_or_default()
-
-            # Always set clean_shutdown to False immediately after loading/recovering
-            # This marks the *current* session as potentially unclean until explicitly marked otherwise
-            self._settings["clean_shutdown"] = False
-            # Save immediately to persist the False state for the current session start
-            self.save_settings()
-
-    def _attempt_settings_recovery_or_default(self):
-        backup_file = self.config_file.with_suffix(f"{self.config_file.suffix}.backup")
-        ctfn_val = None # Corrupted Temp File Name value
-        if backup_file.exists() and backup_file.is_file():
-            self.logger.warning(f"Attempting to restore settings from standard backup: {backup_file}")
-            try:
-                corrupted_file_name = self.config_file.with_suffix(f"{self.config_file.suffix}.corrupted.{int(time.time())}")
-                if self.config_file.exists():
-                    self.config_file.rename(corrupted_file_name)
-                    ctfn_val = corrupted_file_name
-                
-                shutil.copy2(backup_file, self.config_file)
-                
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    restored_data = json.load(f)
-                if not isinstance(restored_data, dict):
-                    raise ConfigurationError("Restored backup file root is not a dictionary.")
-                
-                temp_settings = get_fresh_default_settings()
-                for key, default_val in temp_settings.items():
-                    if key in restored_data:
-                        temp_settings[key] = self._validate_setting_value(key, restored_data[key], default_val)
-                self._settings = temp_settings
-                self._last_session_clean_shutdown = SafeInputValidation.validate_bool(self._settings.get("clean_shutdown", False))
-                self.logger.info(f"Successfully restored and validated settings from {backup_file}.")
-                return
-            except Exception as e_restore:
-                self.logger.error(f"Failed to restore or validate settings from backup {backup_file}: {e_restore}. Resetting to defaults.", exc_info=True)
-                if ctfn_val and ctfn_val.exists():
-                    try: ctfn_val.rename(self.config_file)
-                    except Exception as e_revert: self.logger.error(f"Could not revert from corrupted file {ctfn_val} after failed backup restore: {e_revert}")
-        
-        self.logger.warning(f"Initializing with default settings and saving to {self.config_file} (no usable backup found or backup restore failed).")
-        self._settings = get_fresh_default_settings()
-        self._last_session_clean_shutdown = False
-
-    def _validate_setting_value(self, key: str, loaded_value: Any, default_value_from_schema: Any) -> Any:
+    def _ensure_directories(self):
+        """Ensure settings and backup directories exist"""
         try:
-            if key == "brightness":
-                return SafeInputValidation.validate_integer(loaded_value, 0, 100, default_value_from_schema)
-            elif key == "effect_speed":
-                return SafeInputValidation.validate_integer(loaded_value, 1, 10, default_value_from_schema)
-            elif key == "current_color":
-                if isinstance(loaded_value, dict): return RGBColor.from_dict(loaded_value).to_dict()
-                self.logger.warning(f"Invalid type for '{key}': {type(loaded_value)}, expected dict. Using default.")
-                return default_value_from_schema
-            elif key == "zone_colors":
-                if isinstance(loaded_value, list):
-                    valid_colors = []
-                    default_palette = default_value_from_schema if isinstance(default_value_from_schema, list) and default_value_from_schema else [{"r":0,"g":0,"b":0}]*NUM_ZONES
-                    for i in range(NUM_ZONES):
-                        default_zc_dict = default_palette[i % len(default_palette)]
-                        if i < len(loaded_value) and isinstance(loaded_value[i], dict):
-                            try: valid_colors.append(RGBColor.from_dict(loaded_value[i]).to_dict())
-                            except ValidationError: valid_colors.append(default_zc_dict)
-                        else: valid_colors.append(default_zc_dict)
-                    return valid_colors
-                self.logger.warning(f"Invalid type for '{key}': {type(loaded_value)}, expected list. Using default.")
-                return default_value_from_schema
-            elif key.endswith("_color") and isinstance(default_value_from_schema, str):
-                return SafeInputValidation.validate_color_hex(loaded_value, default_value_from_schema)
-            elif isinstance(default_value_from_schema, bool):
-                return SafeInputValidation.validate_bool(loaded_value, default_value_from_schema)
-            elif isinstance(default_value_from_schema, str):
-                return SafeInputValidation.validate_string(loaded_value, max_length=100, default=default_value_from_schema)
-            
-            # For lists/dicts not specifically handled, ensure type matches
-            if type(loaded_value) == type(default_value_from_schema): return loaded_value
-            else: self.logger.warning(f"Type mismatch for setting '{key}' (loaded: {type(loaded_value)}, expected: {type(default_value_from_schema)}). Using default."); return default_value_from_schema
+            self.settings_file.parent.mkdir(parents=True, exist_ok=True)
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            self.logger.error(f"Unexpected error validating setting '{key}' (value: {loaded_value}): {e}. Using default '{default_value_from_schema}'.", exc_info=True)
-            return default_value_from_schema
+            self.logger.error(f"Failed to create settings directories: {e}")
+            raise ConfigurationError(f"Cannot create settings directories: {e}")
 
-    @safe_execute(severity="high", max_attempts=2)
-    def save_settings(self) -> None:
+    def _load_settings(self):
+        """Load settings from file with validation and error recovery"""
         with self._lock:
             try:
-                self.config_file.parent.mkdir(parents=True, exist_ok=True)
-                data_to_save = self._settings.copy()
-                
-                # Create a simple, non-timestamped backup file before writing a new one.
-                # This file will be overwritten on each successful save, keeping the *last good* version.
-                backup_file = self.config_file.with_suffix(f"{self.config_file.suffix}.backup")
-                if self.config_file.exists():
-                    try: shutil.copy2(self.config_file, backup_file); self.logger.debug(f"Created backup: {backup_file}")
-                    except Exception as e_backup: self.logger.warning(f"Could not create backup before saving: {e_backup}")
-                
-                temp_file_path = self.config_file.with_suffix(f'.tmp.{os.getpid()}')
-                with open(temp_file_path, 'w', encoding='utf-8') as f:
-                    json.dump(data_to_save, f, indent=2, ensure_ascii=False)
-                    f.flush(); os.fsync(f.fileno())
-                
-                os.replace(temp_file_path, self.config_file)
-                self.logger.info(f"Settings successfully saved to {self.config_file}")
+                if self.settings_file.exists():
+                    with open(self.settings_file, 'r', encoding='utf-8') as f:
+                        loaded_settings = json.load(f)
+
+                    if not isinstance(loaded_settings, dict):
+                        raise ValueError("Settings file contains invalid data structure")
+
+                    # Validate and merge with defaults
+                    self._settings = self._validate_and_merge_settings(loaded_settings)
+                    self.logger.info(f"Settings loaded from {self.settings_file}")
+
+                else:
+                    # Use defaults for new installation
+                    self._settings = default_settings.copy()
+                    self.logger.info("Using default settings for new installation")
+                    self._save_settings_immediate()
 
             except Exception as e:
-                self.logger.error(f"Critical error saving settings to {self.config_file}: {e}", exc_info=True)
-                raise ConfigurationError(f"Failed to save settings to {self.config_file}: {e}") from e
+                self.logger.error(f"Failed to load settings: {e}")
 
-    def get(self, key: str, default_override: Optional[Any] = None) -> Any:
-        with self._lock:
-            default_from_schema = get_fresh_default_settings().get(key)
-            effective_default = default_override if default_override is not None else default_from_schema
-            return self._settings.get(key, effective_default)
+                # Attempt to restore from backup
+                if self._restore_from_backup():
+                    self.logger.info("Settings restored from backup")
+                else:
+                    # Fallback to defaults
+                    self.logger.warning("Using default settings due to load failure")
+                    self._settings = default_settings.copy()
+                    self._save_settings_immediate()
 
-    def set(self, key: str, value: Any) -> None:
-        with self._lock:
-            if key not in default_settings:
-                self.logger.warning(f"Attempted to set unknown setting key: '{key}'. Ignoring.")
-                return
-            default_val_for_validation = default_settings.get(key)
-            validated_value = self._validate_setting_value(key, value, default_val_for_validation)
-            if self._settings.get(key) != validated_value or key not in self._settings:
-                self._settings[key] = validated_value
-                # Settings are saved whenever a single setting changes.
-                # This ensures settings are up-to-date even if app crashes shortly after a change.
-                self.save_settings()
-                self.logger.debug(f"Setting '{key}' updated to: {validated_value}")
+    def _validate_and_merge_settings(self, loaded_settings: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Validate loaded settings and merge with defaults
 
-    def update(self, new_settings_dict: Dict[str, Any]) -> None:
-        with self._lock:
-            changed = False
-            for key, value in new_settings_dict.items():
-                if key not in default_settings:
-                    self.logger.warning(f"Update: Ignoring unknown setting key: '{key}'.")
-                    continue
-                default_val_for_validation = default_settings.get(key)
-                validated_value = self._validate_setting_value(key, value, default_val_for_validation)
-                if self._settings.get(key) != validated_value or key not in self._settings:
-                    self._settings[key] = validated_value
-                    changed = True
-                    self.logger.debug(f"Update: Setting '{key}' to: {validated_value}")
-            if changed:
-                self.save_settings()
-                self.logger.info(f"Settings updated. {sum(1 for k in new_settings_dict if k in default_settings)} provided keys processed.")
+        Args:
+            loaded_settings: Settings loaded from file
+
+        Returns:
+            Dict[str, Any]: Validated and merged settings
+        """
+        validated_settings = default_settings.copy()
+
+        for key, value in loaded_settings.items():
+            if key in default_settings:
+                try:
+                    # Validate specific setting types
+                    if key == "zone_colors":
+                        validated_settings[key] = self._validate_zone_colors(value)
+                    elif key == "current_color":
+                        validated_settings[key] = self._validate_color_dict(value)
+                    elif key in ["brightness", "effect_speed"]:
+                        validated_settings[key] = self._validate_numeric_range(value, key)
+                    elif key in ["effect_color", "gradient_start_color", "gradient_end_color"]:
+                        validated_settings[key] = self._validate_hex_color(value)
+                    elif isinstance(value, type(default_settings[key])):
+                        validated_settings[key] = value
+                    else:
+                        self.logger.warning(f"Invalid type for setting '{key}': {type(value)}, using default")
+
+                except Exception as e:
+                    self.logger.warning(f"Validation failed for setting '{key}': {e}, using default")
             else:
-                self.logger.debug("Update called, but no actual setting values changed after validation.")
+                self.logger.debug(f"Unknown setting '{key}' ignored")
 
-    def mark_clean_shutdown(self):
-        """Marks the current session as having performed a clean shutdown."""
-        self.logger.info("Marking clean shutdown in settings.")
-        # Directly update _settings and save to ensure this specific flag is persisted.
+        return validated_settings
+
+    def _validate_zone_colors(self, zone_colors: Any) -> List[Dict[str, int]]:
+        """Validate zone colors setting"""
+        if not isinstance(zone_colors, list):
+            raise ValueError("zone_colors must be a list")
+
+        validated_colors = []
+        for i, color_data in enumerate(zone_colors):
+            try:
+                if isinstance(color_data, dict):
+                    # Validate as RGBColor dictionary
+                    rgb_color = RGBColor.from_dict(color_data)
+                    validated_colors.append(rgb_color.to_dict())
+                else:
+                    raise ValueError(f"Invalid color data type at index {i}")
+            except Exception as e:
+                self.logger.warning(f"Invalid zone color at index {i}: {e}, using default")
+                default_color = default_settings["zone_colors"][i % len(default_settings["zone_colors"])]
+                validated_colors.append(default_color)
+
+        return validated_colors
+
+    def _validate_color_dict(self, color_data: Any) -> Dict[str, int]:
+        """Validate color dictionary"""
+        try:
+            rgb_color = RGBColor.from_dict(color_data)
+            return rgb_color.to_dict()
+        except Exception:
+            return default_settings["current_color"]
+
+    def _validate_numeric_range(self, value: Any, setting_name: str) -> Union[int, float]:
+        """Validate numeric settings with appropriate ranges"""
+        try:
+            if setting_name == "brightness":
+                return max(0, min(100, int(value)))
+            elif setting_name == "effect_speed":
+                return max(1, min(10, int(value)))
+            else:
+                return value
+        except (ValueError, TypeError):
+            return default_settings[setting_name]
+
+    def _validate_hex_color(self, value: Any) -> str:
+        """Validate hex color string"""
+        try:
+            if isinstance(value, str):
+                # Validate by creating RGBColor
+                RGBColor.from_hex(value)
+                return value
+            else:
+                raise ValueError("Hex color must be string")
+        except Exception:
+            # Return appropriate default
+            if "gradient_start" in str(value):
+                return default_settings["gradient_start_color"]
+            elif "gradient_end" in str(value):
+                return default_settings["gradient_end_color"]
+            else:
+                return default_settings["effect_color"]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """
+        Get a setting value
+
+        Args:
+            key: Setting key
+            default: Default value if key not found
+
+        Returns:
+            Any: Setting value or default
+        """
         with self._lock:
-            self._settings["clean_shutdown"] = True
-            self.save_settings()
+            return self._settings.get(key, default)
 
-    def was_previous_session_clean(self) -> bool:
-        """Returns True if the previous session exited cleanly, False otherwise."""
-        return self._last_session_clean_shutdown
+    def set(self, key: str, value: Any) -> bool:
+        """
+        Set a setting value with validation
+
+        Args:
+            key: Setting key
+            value: Setting value
+
+        Returns:
+            bool: True if setting was updated
+        """
+        with self._lock:
+            try:
+                # Validate the setting
+                if key == "zone_colors" and isinstance(value, list):
+                    validated_value = self._validate_zone_colors(value)
+                elif key == "current_color" and isinstance(value, dict):
+                    validated_value = self._validate_color_dict(value)
+                elif key in ["brightness", "effect_speed"]:
+                    validated_value = self._validate_numeric_range(value, key)
+                elif key in ["effect_color", "gradient_start_color", "gradient_end_color"]:
+                    validated_value = self._validate_hex_color(value)
+                else:
+                    validated_value = value
+
+                # Check if value actually changed
+                if self._settings.get(key) != validated_value:
+                    self._settings[key] = validated_value
+                    self._dirty = True
+                    self._schedule_auto_save()
+                    self.logger.debug(f"Setting '{key}' updated")
+                    return True
+
+                return False
+
+            except Exception as e:
+                self.logger.error(f"Failed to set setting '{key}': {e}")
+                return False
+
+    def update(self, settings_dict: Dict[str, Any]) -> int:
+        """
+        Update multiple settings
+
+        Args:
+            settings_dict: Dictionary of settings to update
+
+        Returns:
+            int: Number of settings actually updated
+        """
+        updated_count = 0
+        with self._lock:
+            for key, value in settings_dict.items():
+                if self.set(key, value):
+                    updated_count += 1
+
+        if updated_count > 0:
+            self.logger.info(f"Updated {updated_count} settings")
+
+        return updated_count
+
+    def _schedule_auto_save(self):
+        """Schedule automatic save with delay to batch multiple changes"""
+        if self._auto_save_timer:
+            self._auto_save_timer.cancel()
+
+        self._auto_save_timer = threading.Timer(self._auto_save_delay, self._auto_save_callback)
+        self._auto_save_timer.daemon = True
+        self._auto_save_timer.start()
+
+    def _auto_save_callback(self):
+        """Auto-save callback"""
+        try:
+            self.save_settings()
+        except Exception as e:
+            self.logger.error(f"Auto-save failed: {e}")
+
+    def save_settings(self) -> bool:
+        """
+        Save settings to file
+
+        Returns:
+            bool: True if save was successful
+        """
+        with self._lock:
+            if not self._dirty:
+                return True  # No changes to save
+
+            return self._save_settings_immediate()
+
+    def _save_settings_immediate(self) -> bool:
+        """Immediate save without checking dirty flag"""
+        try:
+            # Create backup before saving
+            self._create_backup()
+
+            # Add metadata
+            settings_with_metadata = self._settings.copy()
+            settings_with_metadata['_metadata'] = {
+                'version': '3.0.0-OSIRIS',
+                'saved_at': datetime.now().isoformat(),
+                'session_id': self._session_id,
+                'session_duration': time.time() - self._session_start_time
+            }
+
+            # Atomic write using temporary file
+            temp_file = self.settings_file.with_suffix('.tmp')
+
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(settings_with_metadata, f, indent=2, ensure_ascii=False)
+
+            # Atomic rename
+            temp_file.replace(self.settings_file)
+
+            self._dirty = False
+            self._last_save_time = time.time()
+            self.logger.debug(f"Settings saved to {self.settings_file}")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to save settings: {e}")
+            return False
+
+    def _create_backup(self):
+        """Create backup of current settings"""
+        try:
+            if self.settings_file.exists():
+                backup_file = self.backup_dir / f"settings_backup_{self._session_id}.json"
+
+                # Copy current settings to backup
+                with open(self.settings_file, 'r', encoding='utf-8') as src:
+                    with open(backup_file, 'w', encoding='utf-8') as dst:
+                        dst.write(src.read())
+
+                # Cleanup old backups (keep last 10)
+                self._cleanup_old_backups()
+
+        except Exception as e:
+            self.logger.warning(f"Failed to create settings backup: {e}")
+
+    def _cleanup_old_backups(self):
+        """Cleanup old backup files"""
+        try:
+            backup_files = list(self.backup_dir.glob("settings_backup_*.json"))
+            backup_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+            # Keep only the 10 most recent backups
+            for old_backup in backup_files[10:]:
+                old_backup.unlink()
+
+        except Exception as e:
+            self.logger.warning(f"Failed to cleanup old backups: {e}")
+
+    def _restore_from_backup(self) -> bool:
+        """Attempt to restore settings from backup"""
+        try:
+            backup_files = list(self.backup_dir.glob("settings_backup_*.json"))
+            backup_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+            for backup_file in backup_files:
+                try:
+                    with open(backup_file, 'r', encoding='utf-8') as f:
+                        backup_settings = json.load(f)
+
+                    # Remove metadata if present
+                    backup_settings.pop('_metadata', None)
+
+                    # Validate and use backup
+                    self._settings = self._validate_and_merge_settings(backup_settings)
+                    self.logger.info(f"Restored settings from backup: {backup_file}")
+                    return True
+
+                except Exception as e:
+                    self.logger.warning(f"Failed to restore from backup {backup_file}: {e}")
+                    continue
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Backup restore failed: {e}")
+            return False
 
     def reset_to_defaults(self):
-        self.logger.info("Resetting all settings to application defaults.")
+        """Reset all settings to defaults"""
         with self._lock:
-            self._settings = get_fresh_default_settings()
-            self._last_session_clean_shutdown = False # After reset, next startup is like first run or unclean
-            self._settings["clean_shutdown"] = False # Mark current state as potentially unclean
+            self._settings = default_settings.copy()
+            self._dirty = True
             self.save_settings()
+            self.logger.info("Settings reset to defaults")
+
+    def export_settings(self, export_file: Path) -> bool:
+        """
+        Export settings to file
+
+        Args:
+            export_file: Export file path
+
+        Returns:
+            bool: True if export was successful
+        """
+        try:
+            export_data = {
+                'settings': self._settings.copy(),
+                'export_info': {
+                    'exported_at': datetime.now().isoformat(),
+                    'version': '3.0.0-OSIRIS',
+                    'exported_from': str(self.settings_file)
+                }
+            }
+
+            with open(export_file, 'w', encoding='utf-8') as f:
+                json.dump(export_data, f, indent=2, ensure_ascii=False)
+
+            self.logger.info(f"Settings exported to {export_file}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to export settings: {e}")
+            return False
+
+    def import_settings(self, import_file: Path) -> bool:
+        """
+        Import settings from file
+
+        Args:
+            import_file: Import file path
+
+        Returns:
+            bool: True if import was successful
+        """
+        try:
+            with open(import_file, 'r', encoding='utf-8') as f:
+                import_data = json.load(f)
+
+            # Extract settings from export format or use direct format
+            if 'settings' in import_data:
+                imported_settings = import_data['settings']
+            else:
+                imported_settings = import_data
+
+            # Validate and merge
+            validated_settings = self._validate_and_merge_settings(imported_settings)
+
+            with self._lock:
+                self._settings = validated_settings
+                self._dirty = True
+                self.save_settings()
+
+            self.logger.info(f"Settings imported from {import_file}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to import settings: {e}")
+            return False
+
+    def was_previous_session_clean(self) -> bool:
+        """
+        Check if the previous session ended cleanly
+
+        Returns:
+            bool: True if previous session was clean
+        """
+        return self.get('clean_shutdown', False)
+
+    def mark_clean_shutdown(self):
+        """Mark the current session as ending cleanly"""
+        self.set('clean_shutdown', True)
+        self.save_settings()
+
+    def mark_unclean_shutdown(self):
+        """Mark the current session as ending uncleanly"""
+        self.set('clean_shutdown', False)
+        # Don't auto-save here to avoid overwriting during crash
+
+    def get_all_settings(self) -> Dict[str, Any]:
+        """
+        Get all settings as a dictionary copy
+
+        Returns:
+            Dict[str, Any]: All settings
+        """
+        with self._lock:
+            return self._settings.copy()
+
+    def has_setting(self, key: str) -> bool:
+        """
+        Check if a setting exists
+
+        Args:
+            key: Setting key
+
+        Returns:
+            bool: True if setting exists
+        """
+        with self._lock:
+            return key in self._settings
+
+    def get_settings_info(self) -> Dict[str, Any]:
+        """
+        Get settings manager information
+
+        Returns:
+            Dict[str, Any]: Settings manager info
+        """
+        return {
+            'settings_file': str(self.settings_file),
+            'backup_dir': str(self.backup_dir),
+            'last_save_time': self._last_save_time,
+            'dirty': self._dirty,
+            'session_start_time': self._session_start_time,
+            'session_id': self._session_id,
+            'session_duration': time.time() - self._session_start_time,
+            'total_settings': len(self._settings),
+            'file_exists': self.settings_file.exists(),
+            'file_size': self.settings_file.stat().st_size if self.settings_file.exists() else 0
+        }
+
+    def cleanup(self):
+        """Cleanup resources"""
+        if self._auto_save_timer:
+            self._auto_save_timer.cancel()
+            self._auto_save_timer = None
+
+        if self._dirty:
+            self.save_settings()
+
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.cleanup()

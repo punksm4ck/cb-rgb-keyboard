@@ -1,0 +1,8 @@
+Package: rgb-orchestration
+Version: 5.3.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: python3, python3-venv, libportaudio2, libpulse-dev, libasound2-dev, ffmpeg, sox, pavucontrol
+Maintainer: Thomas
+Description: Modular RGB orchestration suite with audio-reactive effects, MQTT sync, plugin marketplace, and GUI composer.

@@ -1,253 +1,503 @@
+
+import subprocess
+
+try:
+    subprocess.Popen(["flask", "--app", "api/server.py", "run"])
+except Exception as e:
+    print(f"Failed to start Flask server: {e}")
+
 #!/usr/bin/env python3
-"""RGB Keyboard Controller - Main Entry Point - Enhanced & Robust"""
+"""Enhanced main entry point for RGB Controller with comprehensive initialization"""
 
 import sys
 import os
 import logging
-import subprocess
+import signal
+import argparse
 from pathlib import Path
+from typing import Optional
 
-def setup_python_path():
-    """Setup Python path for imports"""
-    current_dir = Path(__file__).parent
-    if str(current_dir) not in sys.path:
-        sys.path.insert(0, str(current_dir))
+# Add project root to Python path
+PROJECT_ROOT = Path(__file__).parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-def setup_logging():
-    """Setup basic logging"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    return logging.getLogger('RGB_Controller_Main')
+try:
+    from gui.core.constants import APP_NAME, VERSION, LOG_DIR
+    from gui.core.settings import SettingsManager
+    from gui.core.exceptions import CriticalError, log_error_context
+    from gui.utils.system_info import system_info, log_system_info, is_compatible_system
+    from gui.utils.decorators import safe_execute
+    from gui.controller import RGBController
+except ImportError as e:
+    print(f"Critical Import Error: {e}")
+    print("Please ensure all required modules are installed and accessible.")
+    sys.exit(1)
 
-def check_root_privileges():
-    """Check if running with root privileges"""
-    if os.name == 'nt':  # Windows
+
+class ApplicationLauncher:
+    """Enhanced application launcher with comprehensive initialization"""
+
+    def __init__(self):
+        """Initialize application launcher"""
+        self.logger = None
+        self.controller = None
+        self.settings = None
+        self._shutdown_handlers = []
+
+    def setup_logging(self, log_level: str = "INFO", enable_file_logging: bool = True) -> logging.Logger:
+        """
+        Setup comprehensive logging system
+
+        Args:
+            log_level: Logging level
+            enable_file_logging: Whether to enable file logging
+
+        Returns:
+            logging.Logger: Configured logger
+        """
         try:
-            import ctypes
-            return ctypes.windll.shell32.IsUserAnAdmin()
-        except:
-            return False
-    else:  # Unix-like (Linux, macOS)
-        return os.geteuid() == 0
+            # Ensure log directory exists
+            if enable_file_logging:
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-def install_keyboard_library_safe(logger):
-    """Safe keyboard library installation with fallbacks"""
-    try:
-        import keyboard
-        logger.info("✓ Keyboard library already available")
-        return True
-    except ImportError:
-        pass
-    
-    if not check_root_privileges():
-        logger.warning("Not running as root - keyboard library installation skipped")
-        return False
-    
-    logger.info("Attempting to install keyboard library...")
-    
-    # Method 1: Try apt install
-    try:
-        result = subprocess.run(['apt', 'install', '-y', 'python3-keyboard'], 
-                              capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            logger.info("✓ Keyboard library installed via apt")
-            try:
-                import keyboard
-                return True
-            except ImportError:
-                pass
-    except:
-        pass
-    
-    # Method 2: Try pip with --break-system-packages (last resort)
-    try:
-        logger.warning("Attempting pip install with system override...")
-        result = subprocess.run([
-            sys.executable, '-m', 'pip', 'install', 'keyboard', '--break-system-packages'
-        ], capture_output=True, text=True, timeout=30)
-        
-        if result.returncode == 0:
-            logger.info("✓ Keyboard library installed via pip (system override)")
-            try:
-                import keyboard
-                return True
-            except ImportError:
-                pass
-    except:
-        pass
-    
-    logger.warning("⚠ Keyboard library installation failed")
-    logger.warning("ALT+Brightness hotkeys will be disabled")
-    return False
+            # Configure root logger
+            root_logger = logging.getLogger()
+            root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
 
-def create_required_directories(project_dir, logger):
-    """Ensure all required directories exist"""
-    
-    # Security Fix: Define content as an explicit, safe, hardcoded constant 
-    # to resolve the static analysis false positive.
-    INIT_DOCSTRING = '"""Package initialization"""\n' 
-    
-    required_dirs = [
-        project_dir / "gui",
-        project_dir / "gui" / "core",
-        project_dir / "gui" / "effects", 
-        project_dir / "gui" / "hardware",
-        project_dir / "gui" / "utils",
-        project_dir / "logs"
-    ]
-    
-    for dir_path in required_dirs:
-        try:
-            dir_path.mkdir(parents=True, exist_ok=True)
-            # Create __init__.py if it's a Python package directory
-            if "gui" in str(dir_path) and dir_path.name != "gui":
-                init_file = dir_path / "__init__.py"
-                if not init_file.exists():
-                    init_file.write_text(INIT_DOCSTRING) 
+            # Clear any existing handlers
+            root_logger.handlers.clear()
+
+            # Create formatter
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+
+            # Console handler
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.INFO)
+            console_handler.setFormatter(formatter)
+            root_logger.addHandler(console_handler)
+
+            # File handler
+            if enable_file_logging:
+                log_file = LOG_DIR / f"{APP_NAME.lower().replace(' ', '_')}.log"
+                file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+                file_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+                file_handler.setFormatter(formatter)
+                root_logger.addHandler(file_handler)
+
+                print(f"Logging to file: {log_file}")
+
+            # Create application logger
+            app_logger = logging.getLogger("RGBController")
+            app_logger.info(f"=== {APP_NAME} v{VERSION} Starting ===")
+
+            return app_logger
+
         except Exception as e:
-            logger.warning(f"Could not create directory {dir_path}: {e}")
+            print(f"Failed to setup logging: {e}")
+            # Fallback to basic logging
+            logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+            return logging.getLogger("RGBController")
 
-def setup_enhanced_logging(project_dir, logger):
-    """Setup enhanced file logging"""
-    try:
-        log_dir = project_dir / "logs"
-        log_dir.mkdir(exist_ok=True)
-        
-        log_file = log_dir / "rgb_controller_startup.log"
-        
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(logging.DEBUG)
-        file_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-        )
-        file_handler.setFormatter(file_formatter)
-        
-        root_logger = logging.getLogger()
-        root_logger.addHandler(file_handler)
-        root_logger.setLevel(logging.DEBUG)
-        
-        logger.info(f"✓ Enhanced logging to: {log_file}")
-    except Exception as e:
-        logger.warning(f"Could not set up enhanced logging: {e}")
+    def check_system_compatibility(self) -> bool:
+        """
+        Check system compatibility
 
-def run_gui_application(logger):
-    """Run the main GUI application with robust error handling"""
-    try:
-        logger.info("Starting RGB Controller GUI...")
-        
-        # Check privileges
-        if not check_root_privileges():
-            logger.error("ERROR: This application requires root privileges")
-            logger.error("Please run: sudo python3 -m rgb_controller_finalv3")
-            return False
-        
-        # Try to install keyboard library
-        keyboard_available = install_keyboard_library_safe(logger)
-        if not keyboard_available:
-            logger.warning("Keyboard library not available - hotkeys disabled")
-        
-        # Try importing GUI modules with detailed error reporting
+        Returns:
+            bool: True if system is compatible
+        """
         try:
-            logger.info("Importing GUI core modules...")
-            from gui.core.rgb_color import RGBColor
-            from gui.core.constants import APP_NAME, NUM_ZONES
-            logger.info("✓ Core modules imported")
-            
-            logger.info("Importing hardware controller...")
-            from gui.hardware.controller import HardwareController
-            logger.info("✓ Hardware controller imported")
-            
-            logger.info("Importing effects system...")
-            from gui.effects.manager import EffectManager
-            logger.info("✓ Effects system imported")
-            
-            logger.info("Importing main GUI controller...")
-            from gui.controller import main as start_gui_main_loop
-            logger.info("✓ All GUI modules imported successfully")
-            
-            # Start the GUI
-            logger.info("Launching GUI...")
-            start_gui_main_loop()
+            if not is_compatible_system():
+                self.logger.error("System is not compatible with RGB keyboard control")
+                self.logger.error("This application requires Linux with appropriate hardware support")
+                return False
+
+            # Log system information
+            log_system_info(self.logger)
+
             return True
-            
-        except ImportError as e:
-            logger.critical(f"Import error: {e}")
-            logger.critical("Missing or corrupted module files")
-            
-            # Try to provide specific guidance
-            missing_module = str(e).replace("No module named ", "").strip("'")
-            logger.critical(f"Missing module: {missing_module}")
-            
-            if "gui.hardware.controller" in missing_module:
-                logger.critical("Hardware controller module missing!")
-                logger.critical("Run the comprehensive fix script to recreate missing files")
-            elif "gui.core" in missing_module:
-                logger.critical("Core modules missing!")
-                logger.critical("Ensure all core files are present in gui/core/")
-            elif "gui.effects" in missing_module:
-                logger.critical("Effects modules missing!")
-                logger.critical("Ensure effects files are present in gui/effects/")
-            
-            return False
-            
-        except SyntaxError as e:
-            logger.critical(f"Syntax error in module: {e}")
-            logger.critical(f"File: {e.filename}, Line: {e.lineno}")
-            logger.critical("Fix syntax errors in the specified file")
-            return False
-            
-        except Exception as e:
-            logger.critical(f"Unexpected error importing GUI: {e}")
-            import traceback
-            logger.critical(traceback.format_exc())
-            return False
-            
-    except KeyboardInterrupt:
-        logger.info("Application interrupted by user")
-        return True
-    except Exception as e:
-        logger.critical(f"Critical error in main application: {e}")
-        import traceback
-        logger.critical(traceback.format_exc())
-        return False
 
-def main():
-    """Enhanced main entry point"""
-    print("🌈 RGB Keyboard Controller v3 - Enhanced")
-    print("=========================================")
+        except Exception as e:
+            self.logger.error(f"System compatibility check failed: {e}")
+            return False
+
+    @safe_execute(max_attempts=1, severity="critical")
+    def initialize_settings(self) -> bool:
+        """
+        Initialize settings manager
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            self.settings = SettingsManager()
+
+            # Check for clean shutdown
+            if not self.settings.was_previous_session_clean():
+                self.logger.warning("Previous session did not end cleanly")
+
+            # Mark session as starting
+            self.settings.mark_unclean_shutdown()
+
+            self.logger.info("Settings manager initialized")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize settings: {e}")
+            return False
+
+    def setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown"""
+        def signal_handler(signum, frame):
+            self.logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+            self.shutdown()
+            sys.exit(0)
+
+        # Handle common termination signals
+        signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # Termination request
+
+        if hasattr(signal, 'SIGHUP'):
+            signal.signal(signal.SIGHUP, signal_handler)  # Hangup (Unix)
+
+    def register_shutdown_handler(self, handler):
+        """Register a shutdown handler function"""
+        self._shutdown_handlers.append(handler)
+
+    @safe_execute(max_attempts=1, severity="warning")
+    def shutdown(self):
+        """Graceful shutdown procedure"""
+        self.logger.info("Initiating graceful shutdown...")
+
+        try:
+            # Call registered shutdown handlers
+            for handler in self._shutdown_handlers:
+                try:
+                    handler()
+                except Exception as e:
+                    self.logger.error(f"Error in shutdown handler: {e}")
+
+            # Shutdown controller
+            if self.controller:
+                self.controller.cleanup()
+                self.controller = None
+
+            # Mark clean shutdown in settings
+            if self.settings:
+                self.settings.mark_clean_shutdown()
+                self.settings.cleanup()
+                self.settings = None
+
+            self.logger.info("Graceful shutdown completed")
+
+        except Exception as e:
+            self.logger.error(f"Error during shutdown: {e}")
+
+    def create_controller(self) -> Optional[RGBController]:
+        """
+        Create RGB controller instance
+
+        Returns:
+            Optional[RGBController]: Controller instance or None if failed
+        """
+        try:
+            controller = RGBController(
+                settings_manager=self.settings,
+                parent_logger=self.logger
+            )
+
+            # Register shutdown handler
+            self.register_shutdown_handler(controller.cleanup)
+
+            self.logger.info("RGB Controller created successfully")
+            return controller
+
+        except Exception as e:
+            log_error_context(self.logger, e, "Controller creation")
+            return None
+
+
+    def _start_flask_with_retry(self, base_port=5000, max_attempts=5):
+        import subprocess, socket, time
+
+        def is_port_free(port):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                return s.connect_ex(('localhost', port)) != 0
+
+        if not self.settings.get("api_autostart", True):
+            self.logger.info("API auto-start disabled.")
+            return
+
+        for attempt in range(max_attempts):
+            port = base_port + attempt
+            if not is_port_free(port):
+                self.logger.warning(f"Port {port} is in use, trying next...")
+                continue
+            try:
+                subprocess.Popen([
+                    "flask", "--app", "api/server.py", "run", "--port", str(port)
+                ])
+                self.logger.info(f"Flask server started on port {port}")
+                self.settings.set("api_port", port)  # Optional: store for later use
+                return
+            except Exception as e:
+                self.logger.warning(f"Flask start failed on port {port}: {e}")
+                time.sleep(2)
+
+        self.logger.error("Flask server failed to start after retries.")
     
-    # Setup Python path first
-    setup_python_path()
-    
-    # Setup logging
-    logger = setup_logging()
-    
-    # Get project directory
-    project_dir = Path(__file__).parent
-    
-    # Create required directories
-    create_required_directories(project_dir, logger)
-    
-    # Setup enhanced logging
-    setup_enhanced_logging(project_dir, logger)
-    
-    # Log system info
-    logger.info(f"Python version: {sys.version}")
-    logger.info(f"Platform: {sys.platform}")
-    logger.info(f"Running as root: {check_root_privileges()}")
-    logger.info(f"Project directory: {project_dir}")
-    
-    # Run the application
-    success = run_gui_application(logger)
-    
-    if success:
-        logger.info("Application completed successfully")
-        sys.exit(0)
-    else:
-        logger.error("Application failed - check logs for details")
-        sys.exit(1)
+    def run_gui_mode(self, controller: RGBController) -> int:
+        try:
+            self.logger.info("Starting GUI mode...")
+
+            # Initialize and start GUI
+            self._start_flask_with_retry()
+            success = controller.initialize_gui()
+            if not success:
+                self.logger.error("Failed to initialize GUI")
+                return 1
+
+            # Start the GUI main loop
+            controller.run()
+
+            return 0
+
+        except CriticalError as e:
+            self.logger.critical(f"Critical error in GUI mode: {e}")
+            return 2
+        except KeyboardInterrupt:
+            self.logger.info("GUI interrupted by user")
+            return 0
+        except Exception as e:
+            log_error_context(self.logger, e, "GUI mode")
+            return 1
+
+    def run_cli_mode(self, args) -> int:
+        """
+        Run application in CLI mode
+
+        Args:
+            args: Command line arguments
+
+        Returns:
+            int: Exit code
+        """
+        try:
+            self.logger.info("Starting CLI mode...")
+
+            # Simple CLI commands
+            if args.test:
+                return self.run_hardware_test()
+            elif args.info:
+                return self.show_system_info()
+            elif args.brightness is not None:
+                return self.set_brightness_cli(args.brightness)
+            elif args.color:
+                return self.set_color_cli(args.color)
+            else:
+                print("No CLI command specified. Use --help for options.")
+                return 1
+
+        except Exception as e:
+            log_error_context(self.logger, e, "CLI mode")
+            return 1
+
+    def run_hardware_test(self) -> int:
+        """Run hardware test"""
+        try:
+            controller = self.create_controller()
+            if not controller:
+                print("Failed to create controller for hardware test")
+                return 1
+
+            print("Running hardware test...")
+            test_results = controller.test_hardware()
+
+            if test_results.get('overall_success', False):
+                print("✓ Hardware test passed")
+                return 0
+            else:
+                print("✗ Hardware test failed")
+                for error in test_results.get('error_messages', []):
+                    print(f"  - {error}")
+                return 1
+
+        except Exception as e:
+            print(f"Hardware test error: {e}")
+            return 1
+
+    def show_system_info(self) -> int:
+        """Show system information"""
+        try:
+            info = system_info.get_system_info()
+
+            print(f"\n=== {APP_NAME} System Information ===")
+            print(f"Version: {VERSION}")
+            print(f"Platform: {info.get('platform', {}).get('system', 'Unknown')}")
+            print(f"ChromeOS: {'Yes' if info.get('chromeos', {}).get('is_chromeos') else 'No'}")
+            print(f"OSIRIS: {'Yes' if info.get('osiris', {}).get('is_osiris') else 'No'}")
+
+            if info.get('osiris', {}).get('is_osiris'):
+                osiris_info = info['osiris']
+                print(f"Model: {osiris_info.get('model', 'Unknown')}")
+                print(f"Backlight Path: {osiris_info.get('keyboard_backlight_path', 'Not found')}")
+                print(f"Supported Methods: {', '.join(osiris_info.get('supported_methods', ['None']))}")
+
+            return 0
+
+        except Exception as e:
+            print(f"Failed to get system info: {e}")
+            return 1
+
+    def set_brightness_cli(self, brightness: int) -> int:
+        """Set brightness via CLI"""
+        try:
+            controller = self.create_controller()
+            if not controller:
+                print("Failed to create controller")
+                return 1
+
+            success = controller.set_brightness(brightness)
+            if success:
+                print(f"✓ Brightness set to {brightness}%")
+                return 0
+            else:
+                print("✗ Failed to set brightness")
+                return 1
+
+        except Exception as e:
+            print(f"Brightness error: {e}")
+            return 1
+
+    def set_color_cli(self, color_str: str) -> int:
+        """Set color via CLI"""
+        try:
+            from gui.core.rgb_color import RGBColor
+            from gui.utils.input_validation import SafeInputValidation
+
+            color = SafeInputValidation.validate_color(color_str)
+            if not color:
+                print("Invalid color format")
+                return 1
+
+            controller = self.create_controller()
+            if not controller:
+                print("Failed to create controller")
+                return 1
+
+            success = controller.set_color(color)
+            if success:
+                print(f"✓ Color set to {color}")
+                return 0
+            else:
+                print("✗ Failed to set color")
+                return 1
+
+        except Exception as e:
+            print(f"Color error: {e}")
+            return 1
+
+    def main(self) -> int:
+        """
+        Main application entry point
+
+        Returns:
+            int: Exit code
+        """
+        parser = argparse.ArgumentParser(
+            prog=APP_NAME,
+            description=f"{APP_NAME} v{VERSION} - Enhanced RGB Keyboard Control",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Examples:
+  python -m gui                     # Start GUI mode
+  python -m gui --test              # Run hardware test
+  python -m gui --info              # Show system information
+  python -m gui --brightness 75     # Set brightness to 75%
+  python -m gui --color "#FF0000"   # Set color to red
+            """
+        )
+
+        # Mode selection
+        parser.add_argument('--cli', action='store_true',
+                           help='Run in CLI mode (default is GUI)')
+        parser.add_argument('--gui', action='store_true',
+                           help='Run in GUI mode (default)')
+
+        # CLI commands
+        parser.add_argument('--test', action='store_true',
+                           help='Run hardware compatibility test')
+        parser.add_argument('--info', action='store_true',
+                           help='Show system information')
+        parser.add_argument('--brightness', type=int, metavar='N',
+                           help='Set brightness (0-100)')
+        parser.add_argument('--color', metavar='COLOR',
+                           help='Set color (hex format like #FF0000)')
+
+        # Options
+        parser.add_argument('--log-level', default='INFO',
+                           choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                           help='Set logging level')
+        parser.add_argument('--no-file-log', action='store_true',
+                           help='Disable file logging')
+        parser.add_argument('--version', action='version',
+                           version=f'{APP_NAME} v{VERSION}')
+
+        args = parser.parse_args()
+
+        # Setup logging
+        self.logger = self.setup_logging(
+            log_level=args.log_level,
+            enable_file_logging=not args.no_file_log
+        )
+
+        try:
+            # Check system compatibility
+            if not self.check_system_compatibility():
+                return 3  # System compatibility error
+
+            # Initialize settings
+            if not self.initialize_settings():
+                return 4  # Settings initialization error
+
+            # Setup signal handlers
+            self.setup_signal_handlers()
+
+            # Determine mode
+            cli_commands = [args.test, args.info, args.brightness is not None, args.color]
+            if args.cli or any(cli_commands):
+                # CLI mode
+                return self.run_cli_mode(args)
+            else:
+                # GUI mode (default)
+                controller = self.create_controller()
+                if not controller:
+                    return 5  # Controller creation error
+
+                self.controller = controller
+                return self.run_gui_mode(controller)
+
+        except CriticalError as e:
+            self.logger.critical(f"Critical error: {e}")
+            return 2
+        except KeyboardInterrupt:
+            self.logger.info("Application interrupted by user")
+            return 0
+        except Exception as e:
+            log_error_context(self.logger, e, "Main application")
+            return 1
+        finally:
+            self.shutdown()
+
+
+def main() -> int:
+    """Global main function"""
+    launcher = ApplicationLauncher()
+    return launcher.main()
+
 
 if __name__ == "__main__":
-    main()
+    exit_code = main()
+    sys.exit(exit_code)

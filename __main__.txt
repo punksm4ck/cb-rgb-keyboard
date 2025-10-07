@@ -1,0 +1,490 @@
+
+import subprocess
+
+self._start_flask_with_retry()
+try:
+    subprocess.Popen(["flask", "--app", "api/server.py", "run"])
+except Exception as e:
+    print(f"Failed to start Flask server: {e}")
+
+#!/usr/bin/env python3
+"""Enhanced main entry point for RGB Controller with comprehensive initialization"""
+
+import sys
+import os
+import logging
+import signal
+import argparse
+from pathlib import Path
+from typing import Optional
+
+# Add project root to Python path
+PROJECT_ROOT = Path(__file__).parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    from gui.core.constants import APP_NAME, VERSION, LOG_DIR
+    from gui.core.settings import SettingsManager
+    from gui.core.exceptions import CriticalError, log_error_context
+    from gui.utils.system_info import system_info, log_system_info, is_compatible_system
+    from gui.utils.decorators import safe_execute
+    from gui.controller import RGBController
+except ImportError as e:
+    print(f"Critical Import Error: {e}")
+    print("Please ensure all required modules are installed and accessible.")
+    sys.exit(1)
+
+
+class ApplicationLauncher:
+    """Enhanced application launcher with comprehensive initialization"""
+
+    def __init__(self):
+        """Initialize application launcher"""
+        self.logger = None
+        self.controller = None
+        self.settings = None
+        self._shutdown_handlers = []
+
+    def setup_logging(self, log_level: str = "INFO", enable_file_logging: bool = True) -> logging.Logger:
+        """
+        Setup comprehensive logging system
+
+        Args:
+            log_level: Logging level
+            enable_file_logging: Whether to enable file logging
+
+        Returns:
+            logging.Logger: Configured logger
+        """
+        try:
+            # Ensure log directory exists
+            if enable_file_logging:
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Configure root logger
+            root_logger = logging.getLogger()
+            root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+            # Clear any existing handlers
+            root_logger.handlers.clear()
+
+            # Create formatter
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+
+            # Console handler
+            console_handler = logging.StreamHandler(sys.stdout)
+            console_handler.setLevel(logging.INFO)
+            console_handler.setFormatter(formatter)
+            root_logger.addHandler(console_handler)
+
+            # File handler
+            if enable_file_logging:
+                log_file = LOG_DIR / f"{APP_NAME.lower().replace(' ', '_')}.log"
+                file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+                file_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+                file_handler.setFormatter(formatter)
+                root_logger.addHandler(file_handler)
+
+                print(f"Logging to file: {log_file}")
+
+            # Create application logger
+            app_logger = logging.getLogger("RGBController")
+            app_logger.info(f"=== {APP_NAME} v{VERSION} Starting ===")
+
+            return app_logger
+
+        except Exception as e:
+            print(f"Failed to setup logging: {e}")
+            # Fallback to basic logging
+            logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+            return logging.getLogger("RGBController")
+
+    def check_system_compatibility(self) -> bool:
+        """
+        Check system compatibility
+
+        Returns:
+            bool: True if system is compatible
+        """
+        try:
+            if not is_compatible_system():
+                self.logger.error("System is not compatible with RGB keyboard control")
+                self.logger.error("This application requires Linux with appropriate hardware support")
+                return False
+
+            # Log system information
+            log_system_info(self.logger)
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"System compatibility check failed: {e}")
+            return False
+
+    @safe_execute(max_attempts=1, severity="critical")
+    def initialize_settings(self) -> bool:
+        """
+        Initialize settings manager
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            self.settings = SettingsManager()
+
+            # Check for clean shutdown
+            if not self.settings.was_previous_session_clean():
+                self.logger.warning("Previous session did not end cleanly")
+
+            # Mark session as starting
+            self.settings.mark_unclean_shutdown()
+
+            self.logger.info("Settings manager initialized")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize settings: {e}")
+            return False
+
+    def setup_signal_handlers(self):
+        """Setup signal handlers for graceful shutdown"""
+        def signal_handler(signum, frame):
+            self.logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+            self.shutdown()
+            sys.exit(0)
+
+        # Handle common termination signals
+        signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # Termination request
+
+        if hasattr(signal, 'SIGHUP'):
+            signal.signal(signal.SIGHUP, signal_handler)  # Hangup (Unix)
+
+    def register_shutdown_handler(self, handler):
+        """Register a shutdown handler function"""
+        self._shutdown_handlers.append(handler)
+
+    @safe_execute(max_attempts=1, severity="warning")
+    def shutdown(self):
+        """Graceful shutdown procedure"""
+        self.logger.info("Initiating graceful shutdown...")
+
+        try:
+            # Call registered shutdown handlers
+            for handler in self._shutdown_handlers:
+                try:
+                    handler()
+                except Exception as e:
+                    self.logger.error(f"Error in shutdown handler: {e}")
+
+            # Shutdown controller
+            if self.controller:
+                self.controller.cleanup()
+                self.controller = None
+
+            # Mark clean shutdown in settings
+            if self.settings:
+                self.settings.mark_clean_shutdown()
+                self.settings.cleanup()
+                self.settings = None
+
+            self.logger.info("Graceful shutdown completed")
+
+        except Exception as e:
+            self.logger.error(f"Error during shutdown: {e}")
+
+    def create_controller(self) -> Optional[RGBController]:
+        """
+        Create RGB controller instance
+
+        Returns:
+            Optional[RGBController]: Controller instance or None if failed
+        """
+        try:
+            controller = RGBController(
+                settings_manager=self.settings,
+                parent_logger=self.logger
+            )
+
+            # Register shutdown handler
+            self.register_shutdown_handler(controller.cleanup)
+
+            self.logger.info("RGB Controller created successfully")
+            return controller
+
+        except Exception as e:
+            log_error_context(self.logger, e, "Controller creation")
+            return None
+
+
+    def _start_flask_with_retry(self, max_attempts=3):
+        import subprocess, time
+        if not self.settings.get("api_autostart", True):
+            self.logger.info("API auto-start disabled.")
+            return
+        for attempt in range(1, max_attempts + 1):
+            try:
+                subprocess.Popen(["flask", "--app", "api/server.py", "run"])
+                self.logger.info(f"Flask server started on attempt {attempt}")
+                return
+            except Exception as e:
+                self.logger.warning(f"Flask start failed (attempt {attempt}): {e}")
+                time.sleep(2)
+        self.logger.error("Flask server failed to start after retries.")
+    
+    def run_gui_mode(self, controller: RGBController) -> int:
+        try:
+            self.logger.info("Starting GUI mode...")
+
+            # Initialize and start GUI
+            self._start_flask_with_retry()
+            success = controller.initialize_gui()
+            if not success:
+                self.logger.error("Failed to initialize GUI")
+                return 1
+
+            # Start the GUI main loop
+            controller.run()
+
+            return 0
+
+        except CriticalError as e:
+            self.logger.critical(f"Critical error in GUI mode: {e}")
+            return 2
+        except KeyboardInterrupt:
+            self.logger.info("GUI interrupted by user")
+            return 0
+        except Exception as e:
+            log_error_context(self.logger, e, "GUI mode")
+            return 1
+
+    def run_cli_mode(self, args) -> int:
+        """
+        Run application in CLI mode
+
+        Args:
+            args: Command line arguments
+
+        Returns:
+            int: Exit code
+        """
+        try:
+            self.logger.info("Starting CLI mode...")
+
+            # Simple CLI commands
+            if args.test:
+                return self.run_hardware_test()
+            elif args.info:
+                return self.show_system_info()
+            elif args.brightness is not None:
+                return self.set_brightness_cli(args.brightness)
+            elif args.color:
+                return self.set_color_cli(args.color)
+            else:
+                print("No CLI command specified. Use --help for options.")
+                return 1
+
+        except Exception as e:
+            log_error_context(self.logger, e, "CLI mode")
+            return 1
+
+    def run_hardware_test(self) -> int:
+        """Run hardware test"""
+        try:
+            controller = self.create_controller()
+            if not controller:
+                print("Failed to create controller for hardware test")
+                return 1
+
+            print("Running hardware test...")
+            test_results = controller.test_hardware()
+
+            if test_results.get('overall_success', False):
+                print("✓ Hardware test passed")
+                return 0
+            else:
+                print("✗ Hardware test failed")
+                for error in test_results.get('error_messages', []):
+                    print(f"  - {error}")
+                return 1
+
+        except Exception as e:
+            print(f"Hardware test error: {e}")
+            return 1
+
+    def show_system_info(self) -> int:
+        """Show system information"""
+        try:
+            info = system_info.get_system_info()
+
+            print(f"\n=== {APP_NAME} System Information ===")
+            print(f"Version: {VERSION}")
+            print(f"Platform: {info.get('platform', {}).get('system', 'Unknown')}")
+            print(f"ChromeOS: {'Yes' if info.get('chromeos', {}).get('is_chromeos') else 'No'}")
+            print(f"OSIRIS: {'Yes' if info.get('osiris', {}).get('is_osiris') else 'No'}")
+
+            if info.get('osiris', {}).get('is_osiris'):
+                osiris_info = info['osiris']
+                print(f"Model: {osiris_info.get('model', 'Unknown')}")
+                print(f"Backlight Path: {osiris_info.get('keyboard_backlight_path', 'Not found')}")
+                print(f"Supported Methods: {', '.join(osiris_info.get('supported_methods', ['None']))}")
+
+            return 0
+
+        except Exception as e:
+            print(f"Failed to get system info: {e}")
+            return 1
+
+    def set_brightness_cli(self, brightness: int) -> int:
+        """Set brightness via CLI"""
+        try:
+            controller = self.create_controller()
+            if not controller:
+                print("Failed to create controller")
+                return 1
+
+            success = controller.set_brightness(brightness)
+            if success:
+                print(f"✓ Brightness set to {brightness}%")
+                return 0
+            else:
+                print("✗ Failed to set brightness")
+                return 1
+
+        except Exception as e:
+            print(f"Brightness error: {e}")
+            return 1
+
+    def set_color_cli(self, color_str: str) -> int:
+        """Set color via CLI"""
+        try:
+            from gui.core.rgb_color import RGBColor
+            from gui.utils.input_validation import SafeInputValidation
+
+            color = SafeInputValidation.validate_color(color_str)
+            if not color:
+                print("Invalid color format")
+                return 1
+
+            controller = self.create_controller()
+            if not controller:
+                print("Failed to create controller")
+                return 1
+
+            success = controller.set_color(color)
+            if success:
+                print(f"✓ Color set to {color}")
+                return 0
+            else:
+                print("✗ Failed to set color")
+                return 1
+
+        except Exception as e:
+            print(f"Color error: {e}")
+            return 1
+
+    def main(self) -> int:
+        """
+        Main application entry point
+
+        Returns:
+            int: Exit code
+        """
+        parser = argparse.ArgumentParser(
+            prog=APP_NAME,
+            description=f"{APP_NAME} v{VERSION} - Enhanced RGB Keyboard Control",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Examples:
+  python -m gui                     # Start GUI mode
+  python -m gui --test              # Run hardware test
+  python -m gui --info              # Show system information
+  python -m gui --brightness 75     # Set brightness to 75%
+  python -m gui --color "#FF0000"   # Set color to red
+            """
+        )
+
+        # Mode selection
+        parser.add_argument('--cli', action='store_true',
+                           help='Run in CLI mode (default is GUI)')
+        parser.add_argument('--gui', action='store_true',
+                           help='Run in GUI mode (default)')
+
+        # CLI commands
+        parser.add_argument('--test', action='store_true',
+                           help='Run hardware compatibility test')
+        parser.add_argument('--info', action='store_true',
+                           help='Show system information')
+        parser.add_argument('--brightness', type=int, metavar='N',
+                           help='Set brightness (0-100)')
+        parser.add_argument('--color', metavar='COLOR',
+                           help='Set color (hex format like #FF0000)')
+
+        # Options
+        parser.add_argument('--log-level', default='INFO',
+                           choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                           help='Set logging level')
+        parser.add_argument('--no-file-log', action='store_true',
+                           help='Disable file logging')
+        parser.add_argument('--version', action='version',
+                           version=f'{APP_NAME} v{VERSION}')
+
+        args = parser.parse_args()
+
+        # Setup logging
+        self.logger = self.setup_logging(
+            log_level=args.log_level,
+            enable_file_logging=not args.no_file_log
+        )
+
+        try:
+            # Check system compatibility
+            if not self.check_system_compatibility():
+                return 3  # System compatibility error
+
+            # Initialize settings
+            if not self.initialize_settings():
+                return 4  # Settings initialization error
+
+            # Setup signal handlers
+            self.setup_signal_handlers()
+
+            # Determine mode
+            cli_commands = [args.test, args.info, args.brightness is not None, args.color]
+            if args.cli or any(cli_commands):
+                # CLI mode
+                return self.run_cli_mode(args)
+            else:
+                # GUI mode (default)
+                controller = self.create_controller()
+                if not controller:
+                    return 5  # Controller creation error
+
+                self.controller = controller
+                return self.run_gui_mode(controller)
+
+        except CriticalError as e:
+            self.logger.critical(f"Critical error: {e}")
+            return 2
+        except KeyboardInterrupt:
+            self.logger.info("Application interrupted by user")
+            return 0
+        except Exception as e:
+            log_error_context(self.logger, e, "Main application")
+            return 1
+        finally:
+            self.shutdown()
+
+
+def main() -> int:
+    """Global main function"""
+    launcher = ApplicationLauncher()
+    return launcher.main()
+
+
+if __name__ == "__main__":
+    exit_code = main()
+    sys.exit(exit_code)

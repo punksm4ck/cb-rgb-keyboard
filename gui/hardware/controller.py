@@ -1,655 +1,1010 @@
 #!/usr/bin/env python3
-"""Hardware control implementation with full 4-zone RGB support - Fixed Version"""
+"""Enhanced Hardware Controller with comprehensive OSIRIS support and per-key RGB control"""
 
 import os
-import time
-import threading
 import subprocess
+import time
 import logging
-import re
-from typing import List, Tuple, Optional, Dict, Any
+import threading
+import json
 from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
-from ..core.rgb_color import RGBColor
-from ..core.exceptions import KeyboardControlError, HardwareError, ResourceError, ConfigurationError
-from ..core.constants import NUM_ZONES, LEDS_PER_ZONE, ECTOOL_INTER_COMMAND_DELAY, APP_NAME, TOTAL_LEDS
+from ..core.rgb_color import RGBColor, Colors, get_optimal_osiris_brightness
+from ..core.constants import (
+    OSIRIS_KEY_COUNT, HARDWARE_METHODS, DEFAULT_HARDWARE_METHOD,
+    ECTOOL_TIMEOUT, ECTOOL_INTER_COMMAND_DELAY, MAX_RETRY_ATTEMPTS,
+    HARDWARE_COMPATIBILITY
+)
+from ..core.exceptions import (
+    HardwareError, OSIRISHardwareError, ECToolError, PermissionError,
+    ValidationError, CriticalError
+)
+from ..utils.decorators import (
+    safe_execute, thread_safe, performance_monitor,
+    validate_hardware_state, osiris_hardware_optimized
+)
+from ..utils.input_validation import SafeInputValidation, validate_brightness_safe
+from ..utils.safe_subprocess import run_command
+from ..utils.system_info import system_info
 
-from ..utils.decorators import safe_execute
-from ..utils.input_validation import SafeInputValidation
-
-# --- MODIFICATION: Use the system ectool ---
-ECTOOL_EXECUTABLE = "/usr/local/bin/ectool"
-
-# Based on constants.py LEDS_PER_ZONE = 3 and ectool help for `rgbkbd <key> <RGB> [<RGB> ...]`
-# this implies a single command can set these 3 LEDs if three <RGB> values are provided.
-HW_LEDS_PER_ZONE_COMMAND = 3
 
 class HardwareController:
-    def __init__(self, parent_logger, last_control_method: str):
-        self.logger = parent_logger.getChild('HardwareController')
-        self.detection_complete = threading.Event()
-        self.ectool_available = False
-        self.ec_direct_available = False # This will be True if EC Direct is implemented and verified
-        self.hardware_ready = False
-        self.preferred_control_method: Optional[str] = last_control_method
-        self.active_control_method: str = "none"
+    """
+    Enhanced Hardware Controller with comprehensive OSIRIS support
 
-        self.capabilities: Dict[str, bool] = {
-            "ectool_present": False, "ectool_version_ok": False,
-            "ectool_rgbkbd_functional": False,
-            "ectool_rgbkbd_clear_functional": False,
-            "ectool_rgbkbd_demo_off_functional": False,
-            "ectool_pwmsetkblight_ok": False,
-            "ectool_pwmgetkblight_ok": False,
-            "ec_direct_access_ok": False,
-        }
+    Provides unified interface for controlling RGB keyboards with special
+    optimizations for OSIRIS (Acer Chromebook Plus 516 GE) hardware.
+    Supports both per-key RGB control and legacy zone-based systems.
+    """
 
-        self.current_brightness = 100
+    def __init__(self, parent_logger=None):
+        """
+        Initialize hardware controller
+
+        Args:
+            parent_logger: Parent logger instance for consistent logging
+        """
+        self.logger = (parent_logger.getChild('HardwareController')
+                      if parent_logger else logging.getLogger('HardwareController'))
+
+        # Hardware state
         self._lock = threading.RLock()
-        self._zone_colors_cache: List[RGBColor] = [RGBColor(0,0,0) for _ in range(NUM_ZONES)]
-        self._is_effect_running = False
-        self._app_exiting_cleanly = False
-        self._reactive_mode_enabled = False
-        self._reactive_color = RGBColor(255, 255, 255)
-        self._anti_reactive_mode = False
+        self.active_control_method = "none"
+        self.is_osiris_hardware = False
+        self.supports_per_key = False
+        self.current_brightness = 100
+        self.last_colors = [Colors.BLACK] * OSIRIS_KEY_COUNT
 
-        self._detection_thread = threading.Thread(target=self._perform_hardware_detection, daemon=True, name="HardwareDetectionThread")
-        self._detection_thread.start()
+        # Hardware paths and tools
+        self.ectool_path = None
+        self.sysfs_backlight_path = None
+        self.supported_methods = []
 
-    def set_control_method_preference(self, method: str):
-        self.logger.info(f"Control method preference received from GUI: {method}")
-        if method in ["ectool", "ec_direct"]:
-            with self._lock:
-                self.preferred_control_method = method
-                if self.detection_complete.is_set():
-                    self.logger.info("Re-evaluating active control method due to preference change post-detection.")
-                    self._update_active_method_based_on_preference()
-        else:
-            self.logger.warning(f"Invalid control method preference received: {method}")
+        # Performance and safety
+        self.max_update_rate = 30  # Hz
+        self.last_update_time = 0.0
+        self.error_count = 0
+        self.circuit_breaker_active = False
+        self.circuit_breaker_reset_time = 0.0
 
-    def _update_active_method_based_on_preference(self):
-        new_active_method = "none"
-        preferred = self.preferred_control_method
+        # Command execution
+        self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="HardwareExec")
 
-        self.logger.info(f"Updating active method. Preferred: '{preferred}', ectool_available: {self.ectool_available}, ec_direct_framework_ok: {self.capabilities.get('ec_direct_access_ok')}, ec_direct_actually_available: {self.ec_direct_available}")
+        # Initialize hardware detection
+        self._detect_hardware()
 
-        if preferred == "ec_direct":
-            if self.ec_direct_available:
-                new_active_method = "ec_direct"
-                self.logger.info("EC Direct is available and preferred. Setting as active.")
-            elif self.capabilities.get("ec_direct_access_ok"):
-                new_active_method = "ec_direct"
-                self.logger.info("EC Direct framework is selected (preferred). Actual implementation is PENDING. Functions will log warnings.")
-            elif self.ectool_available:
-                new_active_method = "ectool"
-                self.logger.warning("EC Direct preferred but not available/selected. Falling back to ectool.")
-            else:
-                self.logger.error("EC Direct preferred, but neither EC Direct framework nor ectool are available.")
-        elif preferred == "ectool":
-            if self.ectool_available:
-                new_active_method = "ectool"
-                self.logger.info("ectool is available and preferred (or fallback). Setting as active.")
-            elif self.ec_direct_available:
-                new_active_method = "ec_direct"
-                self.logger.warning("ectool preferred but not available. Oddly falling back to fully available EC Direct.")
-            elif self.capabilities.get("ec_direct_access_ok"):
-                new_active_method = "ec_direct"
-                self.logger.warning("ectool preferred but not available. Falling back to EC Direct framework (IMPLEMENTATION PENDING).")
-            else:
-                self.logger.error("ectool preferred, but neither ectool nor EC Direct framework are available.")
-        else:
-            if self.ectool_available:
-                new_active_method = "ectool"
-            elif self.ec_direct_available:
-                new_active_method = "ec_direct"
-            elif self.capabilities.get("ec_direct_access_ok"):
-                new_active_method = "ec_direct"
-            self.logger.info(f"No strong preference or default logic applied. Resulting active method: '{new_active_method}'")
+        self.logger.info(f"Hardware Controller initialized - Method: {self.active_control_method}, "
+                        f"OSIRIS: {self.is_osiris_hardware}, Per-key: {self.supports_per_key}")
 
-        if self.active_control_method != new_active_method:
-            self.logger.info(f"Active control method changed from '{self.active_control_method}' to '{new_active_method}'.")
-        self.active_control_method = new_active_method
+    @safe_execute(max_attempts=1, severity="warning", fallback_return=False)
+    def _detect_hardware(self) -> bool:
+        """
+        Detect available hardware and control methods
 
-        if self.active_control_method == "ectool":
-            self.hardware_ready = self.ectool_available
-        elif self.active_control_method == "ec_direct":
-            self.hardware_ready = self.capabilities.get("ec_direct_access_ok", False)
-        else:
-            self.hardware_ready = False
-        self.logger.info(f"Hardware_ready status: {self.hardware_ready} (Active method: {self.active_control_method})")
-
-
-    @safe_execute(max_attempts=1, severity="critical")
-    def _perform_hardware_detection(self) -> None:
-        self.logger.info(f"Starting hardware detection process. Initial preferred method: {self.preferred_control_method}")
-        time.sleep(0.1)
-        self.logger.info(f"Proceeding with detection. Current preferred method (after potential GUI update): {self.preferred_control_method}")
-
+        Returns:
+            bool: True if hardware detected successfully
+        """
         try:
-            self._detect_ectool()
-            self._detect_ec_direct()
+            # Get system information
+            sys_info = system_info.get_system_info()
 
-            self._update_active_method_based_on_preference()
+            # Check for OSIRIS hardware
+            osiris_info = sys_info.get('osiris', {})
+            self.is_osiris_hardware = osiris_info.get('is_osiris', False)
 
-            if not self.hardware_ready:
-                self.logger.warning("No primary RGB control methods detected, functional, or selected after all checks.")
+            if self.is_osiris_hardware:
+                self.logger.info("✓ OSIRIS hardware detected")
+                self.supports_per_key = True
+                self.sysfs_backlight_path = osiris_info.get('keyboard_backlight_path')
+                self.supported_methods = osiris_info.get('supported_methods', [])
             else:
-                self.logger.info(f"Hardware detection checks completed. Active method: '{self.active_control_method}'.")
+                self.logger.info("Generic hardware detected")
+                self.supports_per_key = False
+                self.supported_methods = self._detect_generic_methods()
+
+            # Find ectool
+            self.ectool_path = self._find_ectool()
+            if self.ectool_path and 'ectool' not in self.supported_methods:
+                self.supported_methods.append('ectool')
+
+            # Select best method
+            self.active_control_method = self._select_best_method()
+
+            # Validate selected method
+            if self.active_control_method != "none":
+                self._validate_method(self.active_control_method)
+                self.max_update_rate = HARDWARE_COMPATIBILITY[self.active_control_method]['max_update_rate']
+
+            self.logger.info(f"Hardware detection complete: {self.active_control_method} "
+                           f"(supported: {', '.join(self.supported_methods)})")
+
+            return True
+
         except Exception as e:
-            self.logger.error(f"Critical error during hardware detection: {e}", exc_info=True)
-            self.hardware_ready = False
+            self.logger.error(f"Hardware detection failed: {e}")
             self.active_control_method = "none"
-        finally:
-            self.detection_complete.set()
-            self.logger.info(f"Hardware detection process finished. ectool_available={self.ectool_available}, ec_direct_framework_ok={self.capabilities.get('ec_direct_access_ok')}, ec_direct_actually_available={self.ec_direct_available}, hardware_ready={self.hardware_ready}, active_method='{self.active_control_method}'")
-            self.log_capabilities()
+            return False
 
-    def _detect_ectool(self) -> None:
-        self.logger.debug(f"Attempting to detect ectool using executable: '{ECTOOL_EXECUTABLE}'")
-        self.ectool_available = False
+    def _detect_generic_methods(self) -> List[str]:
+        """Detect available methods for generic hardware"""
+        methods = []
 
-        if not Path(ECTOOL_EXECUTABLE).is_file():
-            self.logger.error(f"ectool executable not found at specified path: {ECTOOL_EXECUTABLE}")
-            self.capabilities["ectool_present"] = False; return
+        # Check for generic sysfs backlight
+        backlight_paths = [
+            '/sys/class/leds/platform::kbd_backlight',
+            '/sys/class/backlight/platform-keyboard-backlight'
+        ]
 
-        self.logger.info(f"Using ectool at: {ECTOOL_EXECUTABLE}")
-        self.capabilities["ectool_present"] = True
+        for path in backlight_paths:
+            if Path(path).exists():
+                methods.append('ec_direct')
+                self.sysfs_backlight_path = path
+                break
 
+        return methods
+
+    def _find_ectool(self) -> Optional[str]:
+        """Find ectool executable"""
         try:
-            self.logger.debug("Testing 'ectool version'...")
-            success_version, stdout_version, stderr_version = self._run_ectool_cmd_internal(['version'], timeout=3.0, silent=False)
-            self.capabilities["ectool_version_ok"] = success_version
-            if not success_version:
-                self.logger.warning(f"ectool 'version' command failed. Stderr: {stderr_version}, Stdout: {stdout_version}"); return
+            # Common paths
+            common_paths = [
+                '/usr/local/bin/ectool',
+                '/usr/bin/ectool',
+                './ectool/build/src/ectool',
+                '../ectool/build/src/ectool'
+            ]
 
-            self.logger.debug("Testing 'ectool rgbkbd 0 0' (basic single LED to black)...")
-            success_rgbkbd_single, _, stderr_rgbkbd_single = self._run_ectool_cmd_internal(['rgbkbd', '0', '0'], timeout=2.0, silent=False)
-            self.capabilities["ectool_rgbkbd_functional"] = success_rgbkbd_single
-            if not success_rgbkbd_single: self.logger.warning(f"ectool 'rgbkbd <key> <RGB>' basic test failed. Stderr: {stderr_rgbkbd_single}")
+            # Check common paths first
+            for path in common_paths:
+                if Path(path).exists() and os.access(path, os.X_OK):
+                    self.logger.debug(f"Found ectool at: {path}")
+                    return path
 
-            self.logger.debug("Testing 'ectool rgbkbd clear 0' (clear to black)...")
-            success_clear, _, stderr_clear = self._run_ectool_cmd_internal(['rgbkbd', 'clear', '0'], timeout=3.0, silent=False)
-            self.capabilities["ectool_rgbkbd_clear_functional"] = success_clear
-            if not success_clear: self.logger.warning(f"ectool 'rgbkbd clear <RGB>' test failed. Stderr: {stderr_clear}")
+            # Check PATH
+            result = run_command(['which', 'ectool'], timeout=2.0)
+            if result.returncode == 0 and result.stdout.strip():
+                path = result.stdout.strip()
+                self.logger.debug(f"Found ectool in PATH: {path}")
+                return path
 
-            self.logger.debug("Testing 'ectool rgbkbd demo 0' (demo off)...")
-            success_demo_off, _, stderr_demo_off = self._run_ectool_cmd_internal(['rgbkbd', 'demo', '0'], timeout=2.0, silent=False)
-            self.capabilities["ectool_rgbkbd_demo_off_functional"] = success_demo_off
-            if not success_demo_off: self.logger.warning(f"ectool 'rgbkbd demo 0' test failed. Stderr: {stderr_demo_off}")
-
-            self.logger.debug("Testing 'ectool pwmgetkblight'...")
-            success_pwmget, stdout_pwmget, stderr_pwmget = self._run_ectool_cmd_internal(['pwmgetkblight'], timeout=2.0)
-            if success_pwmget and stdout_pwmget is not None:
-                match = re.search(r'(\d+)', stdout_pwmget)
-                if match:
-                    self.current_brightness = SafeInputValidation.validate_integer(match.group(1), 0, 100, 100)
-                    self.capabilities["ectool_pwmgetkblight_ok"] = True
-                    self.logger.info(f"ectool 'pwmgetkblight' available. Current brightness: {self.current_brightness}%")
-                else: self.logger.warning(f"ectool 'pwmgetkblight' output not recognized: '{stdout_pwmget}'")
-            else: self.logger.warning(f"ectool 'pwmgetkblight' failed. Stderr: {stderr_pwmget}, Stdout: '{stdout_pwmget}'")
-
-            test_brightness = self.current_brightness if self.capabilities["ectool_pwmgetkblight_ok"] else 50
-            self.logger.debug(f"Testing 'ectool pwmsetkblight {test_brightness}'...")
-            success_pwmset, _, stderr_pwmset = self._run_ectool_cmd_internal(['pwmsetkblight', str(test_brightness)], timeout=2.0)
-            self.capabilities["ectool_pwmsetkblight_ok"] = success_pwmset
-            if not success_pwmset: self.logger.warning(f"ectool 'pwmsetkblight' command failed. Stderr: {stderr_pwmset}")
-
-            self.ectool_available = (self.capabilities["ectool_present"] and
-                                     self.capabilities["ectool_version_ok"] and
-                                     (self.capabilities["ectool_rgbkbd_functional"] or self.capabilities["ectool_rgbkbd_clear_functional"]) and
-                                     (self.capabilities["ectool_pwmgetkblight_ok"] and self.capabilities["ectool_pwmsetkblight_ok"]))
-            if self.ectool_available: self.logger.info("Core ectool functionalities detected and working.")
-            else: self.logger.warning("Not all core ectool functionalities detected or working. ectool may not be fully operational.")
         except Exception as e:
-            self.logger.error(f"Unexpected error during ectool functional detection: {e}", exc_info=True)
-            self.ectool_available = False
+            self.logger.debug(f"ectool search failed: {e}")
 
-    def _detect_ec_direct(self) -> None:
-        self.logger.info("Checking for EC Direct mode...")
-        self.capabilities["ec_direct_access_ok"] = False
-        self.ec_direct_available = False
-
-        if self.ectool_available:
-            self.capabilities["ec_direct_access_ok"] = True
-            self.ec_direct_available = True
-            self.logger.info("EC Direct access framework is now functional via ectool wrappers.")
-        else:
-            self.logger.info("EC Direct access framework is not functional as ectool is unavailable.")
-
-        if self.ec_direct_available:
-            self.logger.info("EC Direct mode is ready (using ectool wrappers).")
-        else:
-            self.logger.warning("EC Direct mode framework is present but non-functional. Requires ectool or manual implementation.")
-
-
-    def log_capabilities(self):
-        self.logger.info("--- Detected Hardware Capabilities Summary ---")
-        for cap, status in self.capabilities.items(): self.logger.info(f"  {cap}: {'OK' if status else 'FAIL/Unavailable'}")
-        self.logger.info(f"  Preferred Control Method: {self.preferred_control_method}")
-        self.logger.info(f"  Active Control Method: {self.active_control_method}")
-        self.logger.info(f"  Overall Hardware Ready: {self.hardware_ready}")
-        self.logger.info("------------------------------------------")
-
-    @safe_execute(max_attempts=2, severity="medium")
-    def _run_ectool_cmd_internal(self, args: List[str], timeout: float = 1.5, silent: bool = True) -> Tuple[bool, str, str]:
-        cmd_to_run = [ECTOOL_EXECUTABLE] + args
-        if not self.capabilities.get("ectool_present", False):
-            self.logger.error(f"ectool not present, cannot run command: {' '.join(cmd_to_run)}")
-            return False, "", "ectool executable not found"
-
-        self.logger.debug(f"Executing ectool command: {' '.join(cmd_to_run)}")
-        try:
-            result = subprocess.run(cmd_to_run, capture_output=True, timeout=timeout, check=False)
-            success = result.returncode == 0
-            stdout_str = result.stdout.decode('utf-8', errors='replace').strip() if result.stdout else ""
-            stderr_str = result.stderr.decode('utf-8', errors='replace').strip() if result.stderr else ""
-            if not success:
-                self.logger.warning(f"Command {cmd_to_run} FAILED. RC: {result.returncode}. Stderr: '{stderr_str}'. Stdout: '{stdout_str}'")
-            elif not silent:
-                self.logger.debug(f"Command {cmd_to_run} OK. Stdout: '{stdout_str[:100]}'")
-            return success, stdout_str, stderr_str
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"Command timeout: {cmd_to_run}"); return False, "", "Command timeout"
-        except FileNotFoundError:
-            self.logger.error(f"Command not found: {ECTOOL_EXECUTABLE}. Ensure it's correctly specified and executable.")
-            self.ectool_available = False; self.capabilities["ectool_present"] = False
-            return False, "", f"{ECTOOL_EXECUTABLE} not found"
-        except Exception as e:
-            self.logger.error(f"Unexpected error in _run_ectool_cmd_internal for '{cmd_to_run}': {e}", exc_info=True)
-            return False, "", str(e)
-
-    # --- EC Direct Functional Placeholder Methods ---
-    def _ec_direct_set_brightness(self, brightness_percent: int) -> bool:
-        self.logger.debug(f"EC DIRECT: Using ectool wrapper to set brightness to {brightness_percent}%.")
-        return self._run_ectool_cmd_internal(['pwmsetkblight', str(brightness_percent)], silent=False)[0]
-
-    def _ec_direct_get_brightness(self) -> Optional[int]:
-        self.logger.debug("EC DIRECT: Using ectool wrapper to get brightness.")
-        success, stdout, _ = self._run_ectool_cmd_internal(['pwmgetkblight'], silent=False)
-        if success and stdout:
-            match = re.search(r'(\d+)', stdout)
-            if match:
-                return SafeInputValidation.validate_integer(match.group(1), 0, 100, 100)
         return None
 
-    def _ec_direct_set_zone_color(self, zone_0_based: int, color: RGBColor) -> bool:
-        self.logger.debug(f"EC DIRECT: Using ectool wrapper to set zone {zone_0_based + 1} to {color.to_hex()}.")
-        packed_color_val = (color.r << 16) | (color.g << 8) | color.b
-        start_led_index_for_zone = zone_0_based * LEDS_PER_ZONE
-        args = ['rgbkbd', str(start_led_index_for_zone), str(packed_color_val), str(packed_color_val), str(packed_color_val)]
-        return self._run_ectool_cmd_internal(args, silent=True)[0]
+    def _select_best_method(self) -> str:
+        """Select the best available control method"""
+        if not self.supported_methods:
+            return "none"
 
-    def _ec_direct_set_all_leds_color(self, color: RGBColor) -> bool:
-        self.logger.debug(f"EC DIRECT: Using ectool wrapper to set all LEDs to {color.to_hex()}.")
-        packed_color = (color.r << 16) | (color.g << 8) | color.b
-        return self._run_ectool_cmd_internal(['rgbkbd', 'clear', str(packed_color)], silent=False)[0]
+        # Priority order for OSIRIS
+        if self.is_osiris_hardware:
+            preference_order = ['ec_direct', 'ectool']
+        else:
+            preference_order = ['ectool', 'ec_direct']
 
-    def _ec_direct_attempt_stop_hardware_effects(self) -> bool:
-        self.logger.debug("EC DIRECT: Using ectool wrapper to stop hardware effects.")
-        return self._run_ectool_cmd_internal(['rgbkbd', 'demo', '0'], silent=False)[0]
-    # --- End EC Direct Functional Placeholder Methods ---
+        # Select first available preferred method
+        for method in preference_order:
+            if method in self.supported_methods:
+                return method
 
-    def set_brightness(self, brightness_percent: int) -> bool:
-        brightness_percent = SafeInputValidation.validate_integer(brightness_percent, 0, 100, self.current_brightness)
-        self.logger.debug(f"Setting brightness to {brightness_percent}% using '{self.active_control_method}'")
-        with self._lock:
-            if self.active_control_method == "ectool":
-                if not self.capabilities.get("ectool_pwmsetkblight_ok"):
-                    self.logger.warning("ectool: Cannot set brightness: pwmsetkblight capability not OK.")
-                    return False
-                success, _, stderr_str = self._run_ectool_cmd_internal(['pwmsetkblight', str(brightness_percent)], silent=False)
-                if success:
-                    self.current_brightness = brightness_percent
-                    self.logger.info(f"ectool: Brightness set to {brightness_percent}%.")
-                else: self.logger.warning(f"ectool: Failed to set brightness: {stderr_str}")
-                return success
-            elif self.active_control_method == "ec_direct":
-                result = self._ec_direct_set_brightness(brightness_percent)
-                if result: self.current_brightness = brightness_percent
-                return result
+        # Fallback to first available
+        return self.supported_methods[0]
+
+    @safe_execute(max_attempts=1, severity="error")
+    def _validate_method(self, method: str) -> bool:
+        """
+        Validate that a control method works
+
+        Args:
+            method: Method to validate
+
+        Returns:
+            bool: True if method works
+        """
+        try:
+            if method == "ec_direct":
+                return self._validate_ec_direct()
+            elif method == "ectool":
+                return self._validate_ectool()
             else:
-                self.logger.error(f"Cannot set brightness: No active/valid control method. Current: '{self.active_control_method}'")
                 return False
 
-    def get_brightness(self) -> int:
-        self.logger.debug(f"Getting brightness using '{self.active_control_method}'")
-        with self._lock:
-            value_to_return = self.current_brightness
-            obtained_new_value = False
-
-            if self.active_control_method == "ectool":
-                if not self.capabilities.get("ectool_pwmgetkblight_ok"):
-                    self.logger.warning(f"ectool: Cannot get brightness: pwmgetkblight not OK. Returning cached: {value_to_return}%")
-                else:
-                    success, stdout, stderr_str = self._run_ectool_cmd_internal(['pwmgetkblight'], silent=False)
-                    if success and stdout is not None:
-                        match = re.search(r'Current KB backlight:\s*(\d+)%?\s*\(requested\s*(\d+)%?\)', stdout)
-                        if not match: match = re.search(r'(\d+)', stdout)
-                        if match:
-                            val_str = match.group(1); val = SafeInputValidation.validate_integer(val_str, 0, 100, value_to_return)
-                            self.current_brightness = val; value_to_return = val; obtained_new_value = True
-                            self.logger.debug(f"ectool: Got brightness {val}% from output: '{stdout.strip()}'")
-                        else: self.logger.warning(f"ectool: Could not parse brightness from output: '{stdout.strip()}'")
-                    elif not success: self.logger.warning(f"ectool: pwmgetkblight command failed. Stderr: {stderr_str}")
-            elif self.active_control_method == "ec_direct":
-                ec_val = self._ec_direct_get_brightness()
-                if ec_val is not None:
-                    self.current_brightness = ec_val; value_to_return = ec_val; obtained_new_value = True
-            else:
-                self.logger.error(f"Cannot get brightness: No active/valid control method. Current: '{self.active_control_method}'")
-
-            if not obtained_new_value: self.logger.debug(f"Returning cached brightness: {value_to_return}%.")
-            return value_to_return
-
-    def set_zone_color(self, zone_index_1_based: int, color: RGBColor) -> bool:
-        if not (1 <= zone_index_1_based <= NUM_ZONES):
-            self.logger.error(f"Invalid zone index: {zone_index_1_based}. Must be 1-{NUM_ZONES}."); return False
-        if not isinstance(color, RGBColor):
-            self.logger.error(f"Invalid color type for set_zone_color: {type(color)}"); return False
-
-        zone_0_based = zone_index_1_based - 1
-        self.logger.debug(f"Setting zone {zone_index_1_based} to {color.to_hex()} using '{self.active_control_method}'")
-        with self._lock:
-            if self.active_control_method == "ectool":
-                if not self.capabilities.get("ectool_rgbkbd_functional"):
-                    self.logger.warning("ectool: Cannot set zone color: rgbkbd_functional capability is False.")
-                    return False
-                packed_color_val = (color.r << 16) | (color.g << 8) | color.b
-                start_led_index_for_zone = zone_0_based * LEDS_PER_ZONE
-                args = ['rgbkbd', str(start_led_index_for_zone), str(packed_color_val), str(packed_color_val), str(packed_color_val)]
-                success, _, stderr_str = self._run_ectool_cmd_internal(args, silent=True)
-                if success:
-                    self._zone_colors_cache[zone_0_based] = color
-                    self.logger.debug(f"ectool: Zone {zone_index_1_based} successfully set.")
-                else: self.logger.warning(f"ectool: Failed to set zone {zone_index_1_based}. Stderr: {stderr_str}")
-                return success
-            elif self.active_control_method == "ec_direct":
-                result = self._ec_direct_set_zone_color(zone_0_based, color)
-                if result: self._zone_colors_cache[zone_0_based] = color
-                return result
-            else:
-                self.logger.error(f"Cannot set zone color: No active/valid control method. Current: '{self.active_control_method}'")
-                return False
-
-    def set_zone_colors(self, zone_colors: List[RGBColor]) -> bool:
-        if not isinstance(zone_colors, list) or len(zone_colors) != NUM_ZONES:
-            self.logger.error(f"set_zone_colors expects {NUM_ZONES} objects. Got: {len(zone_colors) if isinstance(zone_colors, list) else type(zone_colors)}")
+        except Exception as e:
+            self.logger.error(f"Method validation failed for {method}: {e}")
             return False
-        all_success = True
-        with self._lock:
-            self.logger.info(f"Batch setting {NUM_ZONES} zone colors using '{self.active_control_method}'.")
-            for i, color_obj in enumerate(zone_colors):
-                if not isinstance(color_obj, RGBColor):
-                    self.logger.error(f"Invalid color object at index {i} for batch set: {type(color_obj)}"); all_success = False; continue
-                if not self.set_zone_color(i + 1, color_obj):
-                    all_success = False
-                if self.active_control_method == "ectool" and i < NUM_ZONES - 1:
-                    time.sleep(ECTOOL_INTER_COMMAND_DELAY)
-            if all_success: self.logger.info("All zone colors updated successfully in batch.")
-            else: self.logger.warning("One or more zones failed to update in batch set_zone_colors.")
-        return all_success
 
+    def _validate_ec_direct(self) -> bool:
+        """Validate EC direct method"""
+        if not self.sysfs_backlight_path:
+            return False
+
+        try:
+            # Test read access
+            brightness_file = Path(self.sysfs_backlight_path) / 'brightness'
+            if brightness_file.exists():
+                with open(brightness_file, 'r') as f:
+                    f.read()
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _validate_ectool(self) -> bool:
+        """Validate ectool method"""
+        if not self.ectool_path:
+            return False
+
+        try:
+            # Test ectool with a safe command
+            result = run_command(['sudo', self.ectool_path, 'version'], timeout=ECTOOL_TIMEOUT)
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _check_circuit_breaker(self) -> bool:
+        """
+        Check if circuit breaker is active (too many recent errors)
+
+        Returns:
+            bool: True if operations should be blocked
+        """
+        if not self.circuit_breaker_active:
+            return False
+
+        # Check if reset time has passed
+        if time.time() > self.circuit_breaker_reset_time:
+            self.circuit_breaker_active = False
+            self.error_count = 0
+            self.logger.info("Circuit breaker reset - resuming operations")
+            return False
+
+        return True
+
+    def _handle_error(self, error: Exception, operation: str):
+        """
+        Handle hardware errors with circuit breaker pattern
+
+        Args:
+            error: The error that occurred
+            operation: Description of failed operation
+        """
+        self.error_count += 1
+
+        if self.error_count >= 5:  # Circuit breaker threshold
+            self.circuit_breaker_active = True
+            self.circuit_breaker_reset_time = time.time() + 30  # 30 second timeout
+            self.logger.warning(f"Circuit breaker activated after {self.error_count} errors")
+
+        # Log error with context
+        self.logger.error(f"Hardware error in {operation}: {error}")
+
+    @thread_safe()
+    @performance_monitor(performance_threshold=0.5)
+    def is_operational(self) -> bool:
+        """
+        Check if hardware controller is operational
+
+        Returns:
+            bool: True if controller can perform operations
+        """
+        return (self.active_control_method != "none" and
+                not self.circuit_breaker_active)
+
+    @validate_hardware_state(check_operational=True)
+    @safe_execute(max_attempts=2, severity="error", fallback_return=False)
+    def set_brightness(self, brightness: int) -> bool:
+        """
+        Set keyboard brightness
+
+        Args:
+            brightness: Brightness level (0-100)
+
+        Returns:
+            bool: True if successful
+        """
+        if self._check_circuit_breaker():
+            return False
+
+        brightness = validate_brightness_safe(brightness)
+
+        try:
+            if self.active_control_method == "ec_direct":
+                success = self._set_brightness_ec_direct(brightness)
+            elif self.active_control_method == "ectool":
+                success = self._set_brightness_ectool(brightness)
+            else:
+                success = False
+
+            if success:
+                self.current_brightness = brightness
+                self.logger.debug(f"Brightness set to {brightness}%")
+            else:
+                self._handle_error(HardwareError("Brightness set failed"), "set_brightness")
+
+            return success
+
+        except Exception as e:
+            self._handle_error(e, "set_brightness")
+            return False
+
+    def _set_brightness_ec_direct(self, brightness: int) -> bool:
+        """Set brightness using EC direct method"""
+        try:
+            if not self.sysfs_backlight_path:
+                return False
+
+            brightness_file = Path(self.sysfs_backlight_path) / 'brightness'
+            max_brightness_file = Path(self.sysfs_backlight_path) / 'max_brightness'
+
+            # Get maximum brightness value
+            if max_brightness_file.exists():
+                with open(max_brightness_file, 'r') as f:
+                    max_brightness = int(f.read().strip())
+            else:
+                max_brightness = 100
+
+            # Calculate hardware brightness value
+            hw_brightness = int((brightness / 100.0) * max_brightness)
+
+            # Write brightness
+            with open(brightness_file, 'w') as f:
+                f.write(str(hw_brightness))
+
+            return True
+
+        except (OSError, ValueError) as e:
+            raise OSIRISHardwareError(f"EC direct brightness control failed: {e}",
+                                     osiris_operation="set_brightness",
+                                     sysfs_path=str(brightness_file))
+
+    def _set_brightness_ectool(self, brightness: int) -> bool:
+        """Set brightness using ectool method"""
+        try:
+            if not self.ectool_path:
+                return False
+
+            # For OSIRIS, use rgbkbd command with brightness
+            # This sets a white color at the specified brightness level
+            brightness_color = hex(int((brightness / 100.0) * 255) * 0x010101)  # White color
+
+            # Set all keys to the brightness level (simplified approach)
+            cmd = ['sudo', self.ectool_path, 'rgbkbd', '0', brightness_color]
+            result = run_command(cmd, timeout=ECTOOL_TIMEOUT)
+
+            if result.returncode != 0:
+                raise ECToolError(f"ectool brightness command failed",
+                                ectool_command=' '.join(cmd),
+                                return_code=result.returncode,
+                                stderr=result.stderr)
+
+            return True
+
+        except subprocess.SubprocessError as e:
+            raise ECToolError(f"ectool subprocess error: {e}",
+                            ectool_command=str(cmd) if 'cmd' in locals() else "unknown")
+
+    @osiris_hardware_optimized()
+    @validate_hardware_state(check_operational=True)
+    @safe_execute(max_attempts=2, severity="error", fallback_return=False)
     def set_all_leds_color(self, color: RGBColor) -> bool:
-        self.logger.debug(f"Setting all LEDs to color: {color.to_hex()} using '{self.active_control_method}'")
-        if not isinstance(color, RGBColor):
-            self.logger.error(f"Invalid color type for set_all_leds_color: {type(color)}"); return False
+        """
+        Set all LEDs/keys to the same color
 
-        with self._lock:
-            if self.active_control_method == "ectool":
-                if self.capabilities.get("ectool_rgbkbd_clear_functional"):
-                    packed_color = (color.r << 16) | (color.g << 8) | color.b
-                    success, _, stderr = self._run_ectool_cmd_internal(['rgbkbd', 'clear', str(packed_color)], silent=False)
-                    if success:
-                        self.logger.info(f"ectool: Successfully set all LEDs to {color.to_hex()} using 'rgbkbd clear'.")
-                        self._zone_colors_cache = [color] * NUM_ZONES
-                        return True
-                    else:
-                        self.logger.warning(f"ectool: 'rgbkbd clear' failed ({stderr}). Falling back to per-zone setting.")
-                return self.set_zone_colors([color] * NUM_ZONES)
-            elif self.active_control_method == "ec_direct":
-                result = self._ec_direct_set_all_leds_color(color)
-                if result: self._zone_colors_cache = [color] * NUM_ZONES
-                return result
+        Args:
+            color: Color to set
+
+        Returns:
+            bool: True if successful
+        """
+        if self._check_circuit_breaker():
+            return False
+
+        # Validate color
+        color = SafeInputValidation.validate_color(color, default=Colors.WHITE)
+
+        try:
+            if self.supports_per_key:
+                # Set all keys individually for true per-key support
+                colors = [color] * OSIRIS_KEY_COUNT
+                return self.set_zone_colors(colors)
             else:
-                self.logger.error(f"Cannot set all LEDs color: No active/valid control method. Current: '{self.active_control_method}'")
-                return False
+                # Fallback for legacy zone-based systems
+                return self._set_single_color_legacy(color)
 
-    def attempt_stop_hardware_effects(self) -> bool:
-        self.logger.info(f"Attempting to stop hardware effects using '{self.active_control_method}'.")
-        with self._lock:
+        except Exception as e:
+            self._handle_error(e, "set_all_leds_color")
+            return False
+
+    def _set_single_color_legacy(self, color: RGBColor) -> bool:
+        """Set single color for legacy zone-based systems"""
+        try:
             if self.active_control_method == "ectool":
-                if self.capabilities.get("ectool_rgbkbd_demo_off_functional"):
-                    success, _, stderr = self._run_ectool_cmd_internal(['rgbkbd', 'demo', '0'], silent=False)
-                    if success:
-                        self.logger.info("ectool: 'rgbkbd demo 0' command successful. Clearing LEDs to finalize.")
-                        return self.clear_all_leds()
-                    else:
-                        self.logger.warning(f"ectool: 'rgbkbd demo 0' failed: {stderr}. Falling back to clear_all_leds.")
-                        return self.clear_all_leds()
-                else:
-                    self.logger.warning("ectool: 'rgbkbd demo 0' capability not available. Using clear_all_leds as primary stop method.")
-                    return self.clear_all_leds()
+                # Convert color to hex
+                color_hex = color.to_hex().replace('#', '0x')
+
+                # Set zone 0 (usually covers whole keyboard on simple systems)
+                cmd = ['sudo', self.ectool_path, 'rgbkbd', '0', color_hex]
+                result = run_command(cmd, timeout=ECTOOL_TIMEOUT)
+
+                return result.returncode == 0
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Legacy single color set failed: {e}")
+            return False
+
+    @thread_safe()
+    @performance_monitor(performance_threshold=1.0)
+    @validate_hardware_state(check_operational=True)
+    def set_zone_colors(self, colors: List[RGBColor]) -> bool:
+        """
+        Set colors for multiple zones/keys
+
+        Args:
+            colors: List of colors for each zone/key
+
+        Returns:
+            bool: True if successful
+        """
+        if self._check_circuit_breaker():
+            return False
+
+        # Rate limiting
+        current_time = time.time()
+        min_interval = 1.0 / self.max_update_rate
+        if current_time - self.last_update_time < min_interval:
+            time.sleep(min_interval - (current_time - self.last_update_time))
+
+        try:
+            # Validate colors
+            colors = SafeInputValidation.validate_color_list(
+                colors, min_count=1, max_count=OSIRIS_KEY_COUNT,
+                default=[Colors.WHITE]
+            )
+
+            # Pad or truncate colors to match hardware
+            if len(colors) < OSIRIS_KEY_COUNT:
+                # Extend with last color or black
+                last_color = colors[-1] if colors else Colors.BLACK
+                colors.extend([last_color] * (OSIRIS_KEY_COUNT - len(colors)))
+            elif len(colors) > OSIRIS_KEY_COUNT:
+                colors = colors[:OSIRIS_KEY_COUNT]
+
+            # Apply colors based on hardware method
+            if self.active_control_method == "ectool":
+                success = self._set_zone_colors_ectool(colors)
             elif self.active_control_method == "ec_direct":
-                result = self._ec_direct_attempt_stop_hardware_effects()
-                if result:
-                    return self._ec_direct_set_all_leds_color(RGBColor(0,0,0))
-                return False
+                success = self._set_zone_colors_ec_direct(colors)
             else:
-                self.logger.error(f"Cannot stop hardware effects: No active/valid control method. Current: '{self.active_control_method}'")
+                success = False
+
+            if success:
+                self.last_colors = colors.copy()
+                self.last_update_time = time.time()
+            else:
+                self._handle_error(HardwareError("Zone colors set failed"), "set_zone_colors")
+
+            return success
+
+        except Exception as e:
+            self._handle_error(e, "set_zone_colors")
+            return False
+
+    def _set_zone_colors_ectool(self, colors: List[RGBColor]) -> bool:
+        """
+        Set zone colors using ectool method
+
+        Args:
+            colors: List of colors for each key
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            if not self.ectool_path:
                 return False
 
+            success_count = 0
+            total_keys = min(len(colors), OSIRIS_KEY_COUNT)
+
+            # Batch commands for better performance
+            commands = []
+            for key_id in range(total_keys):
+                color = colors[key_id]
+                color_hex = color.to_hex().replace('#', '0x')
+
+                commands.append([
+                    'sudo', self.ectool_path, 'rgbkbd', str(key_id), color_hex
+                ])
+
+            # Execute commands with controlled timing
+            for i, cmd in enumerate(commands):
+                try:
+                    result = run_command(cmd, timeout=ECTOOL_TIMEOUT)
+                    if result.returncode == 0:
+                        success_count += 1
+                    else:
+                        self.logger.debug(f"Key {i} color set failed: {result.stderr}")
+
+                    # Small delay between commands to prevent overwhelming the hardware
+                    if i < len(commands) - 1:
+                        time.sleep(ECTOOL_INTER_COMMAND_DELAY)
+
+                except Exception as e:
+                    self.logger.debug(f"Command {i} failed: {e}")
+                    continue
+
+            # Consider successful if at least 80% of keys were set
+            success_rate = success_count / total_keys
+            is_successful = success_rate >= 0.8
+
+            if not is_successful:
+                self.logger.warning(f"Zone colors partially failed: {success_count}/{total_keys} successful")
+
+            return is_successful
+
+        except Exception as e:
+            raise ECToolError(f"ectool zone colors failed: {e}")
+
+    def _set_zone_colors_ec_direct(self, colors: List[RGBColor]) -> bool:
+        """
+        Set zone colors using EC direct method (if available)
+
+        Args:
+            colors: List of colors for each zone
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            # For now, EC direct doesn't support per-key RGB on most systems
+            # Convert to average brightness and set as white backlight
+            if len(colors) > 1:
+                avg_brightness = get_optimal_osiris_brightness(colors, method="weighted_average")
+                return self.set_brightness(avg_brightness)
+            else:
+                # Single color - convert to brightness
+                brightness = colors[0].to_osiris_brightness()
+                return self.set_brightness(brightness)
+
+        except Exception as e:
+            raise OSIRISHardwareError(f"EC direct zone colors failed: {e}")
+
+    @safe_execute(max_attempts=1, severity="error", fallback_return=False)
     def clear_all_leds(self) -> bool:
-        self.logger.info(f"Attempting to clear all LEDs (set to black) using '{self.active_control_method}'.")
-        return self.set_all_leds_color(RGBColor(0, 0, 0))
+        """
+        Turn off all LEDs
 
-    def get_zone_color(self, zone_index_1_based: int) -> Optional[RGBColor]:
-        if not (1 <= zone_index_1_based <= NUM_ZONES):
-            self.logger.warning(f"Invalid zone index {zone_index_1_based} for get_zone_color."); return None
-        with self._lock: return self._zone_colors_cache[zone_index_1_based - 1]
+        Returns:
+            bool: True if successful
+        """
+        return self.set_all_leds_color(Colors.BLACK)
 
-    def get_all_zone_colors(self) -> List[RGBColor]:
-        with self._lock: return self._zone_colors_cache[:]
+    def get_current_brightness(self) -> int:
+        """Get current brightness level"""
+        return self.current_brightness
+
+    def get_last_colors(self) -> List[RGBColor]:
+        """Get last set colors"""
+        return self.last_colors.copy()
 
     def get_hardware_info(self) -> Dict[str, Any]:
-        if not self.detection_complete.is_set(): self.wait_for_detection(timeout=1.0)
-        with self._lock:
-            return {
-                "ectool_available_flag": self.ectool_available,
-                "ectool_executable": ECTOOL_EXECUTABLE,
-                "ec_direct_available_flag": self.ec_direct_available,
-                "ec_direct_framework_ok_capability": self.capabilities.get("ec_direct_access_ok"),
-                "hardware_ready_flag": self.is_operational(),
-                "preferred_control_method": self.preferred_control_method,
-                "active_control_method": self.active_control_method,
-                "capabilities_detail": self.capabilities.copy(),
-                "current_brightness_cached": self.current_brightness,
-                "cached_zone_colors": [c.to_dict() for c in self._zone_colors_cache],
-                "num_logical_zones_app": NUM_ZONES,
-                "leds_per_zone_app_config": LEDS_PER_ZONE,
-                "TOTAL_LEDS_CONFIG": TOTAL_LEDS,
+        """
+        Get comprehensive hardware information
+
+        Returns:
+            Dict[str, Any]: Hardware information
+        """
+        return {
+            'controller_version': '3.0.0-OSIRIS',
+            'active_method': self.active_control_method,
+            'supported_methods': self.supported_methods,
+            'is_osiris': self.is_osiris_hardware,
+            'supports_per_key': self.supports_per_key,
+            'key_count': OSIRIS_KEY_COUNT if self.supports_per_key else 4,
+            'max_update_rate': self.max_update_rate,
+            'current_brightness': self.current_brightness,
+            'operational': self.is_operational(),
+            'error_count': self.error_count,
+            'circuit_breaker_active': self.circuit_breaker_active,
+            'ectool_path': self.ectool_path,
+            'sysfs_backlight_path': self.sysfs_backlight_path,
+            'last_update_time': self.last_update_time,
+            'hardware_capabilities': {
+                'per_key_rgb': self.supports_per_key,
+                'brightness_control': True,
+                'reactive_effects': self.supports_per_key and self.active_control_method == "ec_direct",
+                'fast_updates': self.max_update_rate >= 20
             }
+        }
 
-    def get_active_method_display(self) -> str:
-        if not self.detection_complete.is_set(): return "Detecting..."
-        if self.active_control_method == "ectool": return "ectool"
-        elif self.active_control_method == "ec_direct":
-            if self.ec_direct_available: return "EC Direct (Implemented)"
-            else: return "EC Direct (NEEDS IMPLEMENTATION)"
-        return "None"
+    @safe_execute(max_attempts=1, severity="error", fallback_return={})
+    def test_hardware(self) -> Dict[str, Any]:
+        """
+        Comprehensive hardware test
 
+        Returns:
+            Dict[str, Any]: Test results
+        """
+        test_results = {
+            'overall_success': False,
+            'tests_passed': 0,
+            'tests_failed': 0,
+            'test_details': [],
+            'error_messages': []
+        }
 
-    def wait_for_detection(self, timeout: float = 10.0) -> bool:
-        if self.detection_complete.is_set(): return True
-        self.logger.debug(f"Waiting up to {timeout}s for hardware detection...")
-        detected = self.detection_complete.wait(timeout)
-        if not detected: self.logger.warning(f"Hardware detection timed out after {timeout}s.")
-        return detected
+        tests = [
+            ('Hardware Detection', self._test_detection),
+            ('Method Validation', self._test_method_validation),
+            ('Brightness Control', self._test_brightness_control),
+            ('Color Control', self._test_color_control),
+            ('Performance Test', self._test_performance)
+        ]
 
-    def is_operational(self) -> bool:
-        if not self.detection_complete.is_set(): return False
-        return self.hardware_ready
+        for test_name, test_func in tests:
+            try:
+                self.logger.info(f"Running test: {test_name}")
+                result = test_func()
 
-    def is_effect_running(self) -> bool: return self._is_effect_running
-    def set_effect_running_status(self, status: bool): self._is_effect_running = status
-    def set_app_exiting_cleanly(self, status: bool):
-        self.logger.debug(f"Setting app_exiting_cleanly to: {status}"); self._app_exiting_cleanly = status
+                test_results['test_details'].append({
+                    'name': test_name,
+                    'passed': result,
+                    'message': f"{test_name} {'passed' if result else 'failed'}"
+                })
 
-    def stop_current_effect(self):
-        self.set_effect_running_status(False)
-        self.logger.debug("HardwareController: User/EffectManager requested stop_current_effect (software effect).")
-        self.attempt_stop_hardware_effects()
-
-    def set_reactive_mode(self, enabled: bool, color: RGBColor, anti_mode: bool = False) -> bool:
-        self.logger.info(f"Setting reactive mode: enabled={enabled}, anti_mode={anti_mode}, color={color.to_hex()}")
-
-        with self._lock:
-            if enabled:
-                self._reactive_mode_enabled = True
-                self._reactive_color = color
-                self._anti_reactive_mode = anti_mode
-
-                if anti_mode:
-                    return self.set_all_leds_color(color)
+                if result:
+                    test_results['tests_passed'] += 1
                 else:
-                    return self.clear_all_leds()
-            else:
-                self._reactive_mode_enabled = False
-                return self.clear_all_leds()
-        self.logger.info(f"Setting reactive mode: enabled={enabled}, anti_mode={anti_mode}, color={color.to_hex()}")
+                    test_results['tests_failed'] += 1
+                    test_results['error_messages'].append(f"{test_name} test failed")
 
-        with self._lock:
-            if enabled:
-                self._reactive_mode_enabled = True
-                self._reactive_color = color
-                self._anti_reactive_mode = anti_mode
+            except Exception as e:
+                self.logger.error(f"Test {test_name} threw exception: {e}")
+                test_results['tests_failed'] += 1
+                test_results['error_messages'].append(f"{test_name}: {str(e)}")
+                test_results['test_details'].append({
+                    'name': test_name,
+                    'passed': False,
+                    'message': f"{test_name} failed with exception: {str(e)}"
+                })
 
-                # Initialize keyboard state
-                if anti_mode:
-                    # Anti-reactive: start with all keys on
-                    return self.set_all_leds_color(color)
-                else:
-                    # Reactive: start with all keys off
-                    return self.clear_all_leds()
-            else:
-                self._reactive_mode_enabled = False
-                return self.clear_all_leds()
-        self.logger.info(f"Setting reactive mode: enabled={enabled}, anti_mode={anti_mode}, color={color.to_hex()}")
+        test_results['overall_success'] = test_results['tests_failed'] == 0
 
-        with self._lock:
-            if enabled:
-                self._reactive_mode_enabled = True
-                self._reactive_color = color
-                self._anti_reactive_mode = anti_mode
+        self.logger.info(f"Hardware test complete: {test_results['tests_passed']} passed, "
+                        f"{test_results['tests_failed']} failed")
 
-                # Initialize keyboard state
-                if anti_mode:
-                    # Anti-reactive: start with all keys on
-                    return self.set_all_leds_color(color)
-                else:
-                    # Reactive: start with all keys off
-                    return self.clear_all_leds()
-            else:
-                self._reactive_mode_enabled = False
-                return self.clear_all_leds()
-    def handle_key_press(self, key_position: int, pressed: bool) -> bool:
-        """Handle individual key press for reactive effects"""
-        if not getattr(self, '_reactive_mode_enabled', False):
-            return True  # Not in reactive mode
+        return test_results
 
-        try:
-            zone_index = min(key_position // (TOTAL_LEDS // NUM_ZONES), NUM_ZONES - 1)
+    def _test_detection(self) -> bool:
+        """Test hardware detection"""
+        return self.active_control_method != "none"
 
-            if getattr(self, '_anti_reactive_mode', False):
-                target_color = RGBColor(0, 0, 0) if pressed else getattr(self, '_reactive_color', RGBColor(255, 255, 255))
-            else:
-                target_color = getattr(self, '_reactive_color', RGBColor(255, 255, 255)) if pressed else RGBColor(0, 0, 0)
+    def _test_method_validation(self) -> bool:
+        """Test method validation"""
+        return self._validate_method(self.active_control_method)
 
-            return self.set_zone_color(zone_index + 1, target_color)
-
-        except Exception as e:
-            self.logger.error(f"Error handling key press {key_position}: {e}")
-            return False
-        """Handle individual key press for reactive effects"""
-        if not getattr(self, '_reactive_mode_enabled', False):
-            return True  # Not in reactive mode
-
-        try:
-            # Convert key position to zone using a more robust mapping
-            zone_index = min(key_position // (TOTAL_LEDS // NUM_ZONES), NUM_ZONES - 1)
-
-            if getattr(self, '_anti_reactive_mode', False):
-                # Anti-reactive: turn off when pressed
-                target_color = RGBColor(0, 0, 0) if pressed else getattr(self, '_reactive_color', RGBColor(255, 255, 255))
-            else:
-                # Reactive: turn on when pressed
-                target_color = getattr(self, '_reactive_color', RGBColor(255, 255, 255)) if pressed else RGBColor(0, 0, 0)
-
-            return self.set_zone_color(zone_index + 1, target_color)
-
-        except Exception as e:
-            self.logger.error(f"Error handling key press {key_position}: {e}")
-            return False
-        """Handle individual key press for reactive effects"""
-        if not getattr(self, '_reactive_mode_enabled', False):
-            return True  # Not in reactive mode
-
-        try:
-            # Convert key position to zone (simplified mapping)
-            zone_index = min(key_position // (TOTAL_LEDS // NUM_ZONES), NUM_ZONES - 1)
-
-            if getattr(self, '_anti_reactive_mode', False):
-                # Anti-reactive: turn off when pressed
-                target_color = RGBColor(0, 0, 0) if pressed else getattr(self, '_reactive_color', RGBColor(255, 255, 255))
-            else:
-                # Reactive: turn on when pressed
-                target_color = getattr(self, '_reactive_color', RGBColor(255, 255, 255)) if pressed else RGBColor(0, 0, 0)
-
-            return self.set_zone_color(zone_index + 1, target_color)
-
-        except Exception as e:
-            self.logger.error(f"Error handling key press {key_position}: {e}")
-            return False
-    def simulate_key_press_pattern(self, pattern_name: str = "typing") -> bool:
-        if not getattr(self, '_reactive_mode_enabled', False):
+    def _test_brightness_control(self) -> bool:
+        """Test brightness control"""
+        if not self.is_operational():
             return False
 
         try:
-            if pattern_name == "typing":
-                import time
-                for zone in range(NUM_ZONES):
-                    if getattr(self, '_anti_reactive_mode', False):
-                        self.set_zone_color(zone + 1, RGBColor(0, 0, 0))
-                        time.sleep(0.1)
-                        self.set_zone_color(zone + 1, getattr(self, '_reactive_color', RGBColor(255, 255, 255)))
-                    else:
-                        self.set_zone_color(zone + 1, getattr(self, '_reactive_color', RGBColor(255, 255, 255)))
-                        time.sleep(0.1)
-                        self.set_zone_color(zone + 1, RGBColor(0, 0, 0))
+            # Save current brightness
+            original_brightness = self.current_brightness
+
+            # Test setting different brightness levels
+            test_levels = [50, 75, 25]
+            for level in test_levels:
+                if not self.set_brightness(level):
+                    return False
+                time.sleep(0.1)  # Small delay between tests
+
+            # Restore original brightness
+            self.set_brightness(original_brightness)
+            return True
+
+        except Exception:
+            return False
+
+    def _test_color_control(self) -> bool:
+        """Test color control"""
+        if not self.is_operational():
+            return False
+
+        try:
+            # Test setting a simple color
+            test_color = RGBColor(255, 0, 0)  # Red
+            success = self.set_all_leds_color(test_color)
+
+            if success:
+                time.sleep(0.2)  # Brief display
+                # Clear colors
+                self.clear_all_leds()
+
+            return success
+
+        except Exception:
+            return False
+
+    def _test_performance(self) -> bool:
+        """Test performance characteristics"""
+        if not self.is_operational():
+            return False
+
+        try:
+            start_time = time.time()
+            test_iterations = 5
+
+            # Test rapid color changes
+            colors = [Colors.RED, Colors.GREEN, Colors.BLUE, Colors.WHITE, Colors.BLACK]
+
+            for i in range(test_iterations):
+                color = colors[i % len(colors)]
+                if not self.set_all_leds_color(color):
+                    return False
+
+            elapsed = time.time() - start_time
+            operations_per_second = test_iterations / elapsed
+
+            # Should be able to handle at least 5 operations per second
+            return operations_per_second >= 5.0
+
+        except Exception:
+            return False
+
+    def force_method_change(self, method: str) -> bool:
+        """
+        Force change to specific control method (for testing/debugging)
+
+        Args:
+            method: Method to switch to
+
+        Returns:
+            bool: True if successful
+        """
+        if method not in HARDWARE_METHODS:
+            self.logger.error(f"Unknown method: {method}")
+            return False
+
+        if method not in self.supported_methods and method != "none":
+            self.logger.error(f"Method not supported: {method}")
+            return False
+
+        try:
+            with self._lock:
+                old_method = self.active_control_method
+                self.active_control_method = method
+
+                if method != "none":
+                    if not self._validate_method(method):
+                        self.active_control_method = old_method
+                        return False
+
+                    self.max_update_rate = HARDWARE_COMPATIBILITY[method]['max_update_rate']
+
+                self.logger.info(f"Control method changed: {old_method} -> {method}")
                 return True
 
+        except Exception as e:
+            self.logger.error(f"Failed to change method to {method}: {e}")
             return False
+
+    def reset_circuit_breaker(self):
+        """Reset the circuit breaker manually"""
+        with self._lock:
+            self.circuit_breaker_active = False
+            self.error_count = 0
+            self.circuit_breaker_reset_time = 0.0
+            self.logger.info("Circuit breaker manually reset")
+
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """
+        Get performance statistics
+
+        Returns:
+            Dict[str, Any]: Performance data
+        """
+        current_time = time.time()
+        return {
+            'max_update_rate': self.max_update_rate,
+            'last_update_time': self.last_update_time,
+            'time_since_last_update': current_time - self.last_update_time,
+            'error_count': self.error_count,
+            'circuit_breaker_active': self.circuit_breaker_active,
+            'operational': self.is_operational(),
+            'method': self.active_control_method,
+            'supports_per_key': self.supports_per_key
+        }
+
+    def emergency_shutdown(self):
+        """Emergency shutdown - turn off all lights immediately"""
+        try:
+            self.logger.warning("Emergency shutdown initiated")
+
+            # Try to clear all LEDs quickly
+            if self.active_control_method == "ectool" and self.ectool_path:
+                # Quick shutdown using ectool
+                cmd = ['sudo', self.ectool_path, 'rgbkbd', '0', '0x000000']
+                subprocess.run(cmd, timeout=2, capture_output=True)
+
+            # Update internal state
+            self.last_colors = [Colors.BLACK] * OSIRIS_KEY_COUNT
+            self.logger.info("Emergency shutdown completed")
 
         except Exception as e:
-            self.logger.error(f"Error simulating key press pattern: {e}")
-            return False
+            self.logger.error(f"Emergency shutdown failed: {e}")
+
+    def get_supported_features(self) -> Dict[str, bool]:
+        """
+        Get list of supported features for current hardware
+
+        Returns:
+            Dict[str, bool]: Feature support matrix
+        """
+        if self.active_control_method == "none":
+            return {feature: False for feature in [
+                'brightness_control', 'per_key_rgb', 'zone_control',
+                'reactive_effects', 'fast_updates', 'color_accuracy'
+            ]}
+
+        compatibility = HARDWARE_COMPATIBILITY[self.active_control_method]
+
+        return {
+            'brightness_control': compatibility['supports_brightness'],
+            'per_key_rgb': compatibility['supports_per_key'] and self.supports_per_key,
+            'zone_control': compatibility['supports_zones'],
+            'reactive_effects': compatibility['supports_reactive'],
+            'fast_updates': compatibility['max_update_rate'] >= 20,
+            'color_accuracy': self.active_control_method == "ec_direct",
+            'requires_root': compatibility['requires_root'],
+            'cross_platform': len(compatibility['platform_support']) > 1
+        }
+
+    def validate_color_list(self, colors: List[Any]) -> List[RGBColor]:
+        """
+        Validate and convert color list for hardware
+
+        Args:
+            colors: List of colors to validate
+
+        Returns:
+            List[RGBColor]: Validated colors
+        """
+        return SafeInputValidation.validate_color_list(
+            colors,
+            min_count=1,
+            max_count=OSIRIS_KEY_COUNT if self.supports_per_key else 4,
+            default=[Colors.WHITE]
+        )
+
+    def get_optimal_update_rate(self) -> float:
+        """
+        Get optimal update rate for current hardware
+
+        Returns:
+            float: Recommended updates per second
+        """
+        base_rate = self.max_update_rate
+
+        # Adjust based on error rate
+        if self.error_count > 0:
+            base_rate *= 0.8  # Reduce rate if errors occurred
+
+        # Adjust based on method
+        if self.active_control_method == "ectool":
+            base_rate *= 0.7  # ectool is slower due to subprocess overhead
+
+        return max(1.0, base_rate)
+
+    def cleanup(self):
+        """Clean up hardware controller resources"""
+        try:
+            self.logger.info("Cleaning up Hardware Controller...")
+
+            # Turn off all LEDs
+            self.clear_all_leds()
+
+            # Shutdown executor
+            if hasattr(self, 'executor'):
+                self.executor.shutdown(wait=True, timeout=5.0)
+
+            # Reset circuit breaker
+            self.reset_circuit_breaker()
+
+            self.logger.info("Hardware Controller cleanup completed")
+
+        except Exception as e:
+            self.logger.error(f"Error during Hardware Controller cleanup: {e}")
+
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.cleanup()
 
     def __del__(self):
-        self.logger.debug(f"HardwareController instance being deleted. App exiting cleanly: {self._app_exiting_cleanly}, Effect running: {self._is_effect_running}")
-        if not self._app_exiting_cleanly:
-            self.logger.info("Attempting to clear LEDs on unclean HardwareController deletion.")
-            try:
-                if hasattr(self, 'detection_complete') and not self.detection_complete.is_set():
-                    self.detection_complete.wait(timeout=0.2)
+        """Destructor"""
+        try:
+            self.cleanup()
+        except:
+            pass
 
-                if self.active_control_method == "ectool" and self.ectool_available:
-                    self.clear_all_leds()
-                    self.logger.info("LEDs cleared via ectool on HardwareController unclean deletion.")
-                elif self.active_control_method == "ec_direct" and self.capabilities.get("ec_direct_access_ok"):
-                    self.logger.warning("EC Direct was active on unclean deletion; clear_all_leds called, but depends on user implementation.")
-                    self.clear_all_leds()
-                else:
-                    self.logger.warning(f"Cannot clear LEDs on unclean deletion: No suitable active control method ('{self.active_control_method}').")
-            except Exception as e:
-                self.logger.warning(f"Error clearing LEDs during HardwareController unclean deletion: {e}")
-        else:
-            self.logger.info("LEDs not cleared on HardwareController deletion due to clean exit flag.")
+
+# Factory functions for easy controller creation
+def create_hardware_controller(logger=None, preferred_method: Optional[str] = None) -> HardwareController:
+    """
+    Create hardware controller with optional method preference
+
+    Args:
+        logger: Logger instance
+        preferred_method: Preferred control method
+
+    Returns:
+        HardwareController: Configured controller
+    """
+    controller = HardwareController(logger)
+
+    if preferred_method and preferred_method in controller.supported_methods:
+        controller.force_method_change(preferred_method)
+
+    return controller
+
+
+def detect_hardware_capabilities() -> Dict[str, Any]:
+    """
+    Quick hardware capability detection without creating full controller
+
+    Returns:
+        Dict[str, Any]: Hardware capabilities
+    """
+    try:
+        # Quick detection without full initialization
+        sys_info = system_info.get_system_info()
+        osiris_info = sys_info.get('osiris', {})
+
+        return {
+            'is_osiris': osiris_info.get('is_osiris', False),
+            'supported_methods': osiris_info.get('supported_methods', []),
+            'per_key_support': osiris_info.get('is_osiris', False),
+            'platform': sys_info.get('platform', {}).get('system', 'Unknown'),
+            'chromeos': sys_info.get('chromeos', {}).get('is_chromeos', False)
+        }
+
+    except Exception:
+        return {
+            'is_osiris': False,
+            'supported_methods': [],
+            'per_key_support': False,
+            'platform': 'Unknown',
+            'chromeos': False
+        }
+
+
+def test_hardware_quickly() -> bool:
+    """
+    Quick hardware test without full controller initialization
+
+    Returns:
+        bool: True if hardware appears functional
+    """
+    try:
+        controller = HardwareController()
+        if not controller.is_operational():
+            controller.cleanup()
+            return False
+
+        # Quick test
+        success = controller.set_brightness(50)
+        controller.cleanup()
+        return success
+
+    except Exception:
+        return False

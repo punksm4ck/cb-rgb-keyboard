@@ -1,0 +1,3 @@
+#!/bin/bash
+source /opt/rgb-orchestration/env/bin/activate
+python3 /opt/rgb-orchestration/__main__.py

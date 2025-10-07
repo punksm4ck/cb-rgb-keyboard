@@ -1,0 +1,2554 @@
+#!/usr/bin/env python3
+"""Enhanced GUI Controller with per-key RGB support and comprehensive effects management"""
+
+import tkinter as tk
+from tkinter import ttk, colorchooser, messagebox, filedialog
+import threading
+import time
+import logging
+from typing import Dict, Any, List, Optional, Callable
+from pathlib import Path
+import json
+
+from .core.constants import (
+    APP_NAME, VERSION, OSIRIS_KEY_COUNT, EFFECT_CATEGORIES,
+    COLOR_PRESETS, GAMING_COLOR_PROFILES, OSIRIS_KEY_LAYOUT,
+    PREVIEW_WIDTH, PREVIEW_HEIGHT, UI_THEMES
+)
+from .core.rgb_color import RGBColor, Colors
+from .core.settings import SettingsManager
+from .core.exceptions import RGBControllerError, HardwareError, ConfigurationError
+from .hardware.controller import HardwareController
+from .effects.library import EFFECT_REGISTRY, effect_manager
+from .effects.manager import EffectManager
+from .utils.decorators import safe_execute, ui_safe
+from .utils.input_validation import SafeInputValidation
+from .utils.system_info import system_info
+# Register custom firmware-level effects
+EFFECT_REGISTRY.update({
+    "Wave": {"category": "Custom"},
+    "Pulse": {"category": "Custom"},
+    "Gradient": {"category": "Custom"}
+})
+
+class RGBController:
+    """
+    Enhanced RGB Controller GUI with comprehensive per-key support
+
+    Provides complete control interface for OSIRIS 100-key RGB keyboard
+    with advanced effects, per-key customization, and system integration.
+    """
+
+    def __init__(self, settings_manager: SettingsManager = None, parent_logger: logging.Logger = None):
+        """
+        Initialize RGB Controller
+
+        Args:
+            settings_manager: Settings manager instance
+            parent_logger: Parent logger for hierarchical logging
+        """
+        # Core components
+        self.logger = parent_logger.getChild('RGBController') if parent_logger else logging.getLogger('RGBController')
+        self.settings = settings_manager or SettingsManager()
+
+        # Hardware and effects
+        self.hardware: Optional[HardwareController] = None
+        self.effect_manager: Optional[EffectManager] = None
+        self.current_effect: Optional[str] = None
+
+        # GUI components
+        self.root: Optional[tk.Tk] = None
+        self.main_frame: Optional[ttk.Frame] = None
+        self.preview_canvas: Optional[tk.Canvas] = None
+        self.status_bar: Optional[ttk.Label] = None
+
+        # State management
+        self.gui_initialized = False
+        self.closing = False
+        self.current_colors = [Colors.BLACK] * OSIRIS_KEY_COUNT
+
+        # Threading
+        self._update_thread: Optional[threading.Thread] = None
+        self._stop_update_thread = threading.Event()
+
+        self.logger.info(f"RGB Controller initialized - {APP_NAME} v{VERSION}")
+
+    @safe_execute(max_attempts=1, severity="critical")
+    def initialize_gui(self) -> bool:
+        """
+        Initialize the GUI components
+
+        Returns:
+            bool: True if initialization successful
+        """
+        try:
+            # Create main window
+            self.root = tk.Tk()
+            self.root.title(f"{APP_NAME} v{VERSION}")
+            self.root.geometry("900x700")
+            self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+            # Apply theme
+            self._apply_theme()
+
+            # Create main layout
+            self._create_main_layout()
+
+            # Initialize hardware
+            self._initialize_hardware()
+
+            # Initialize effects manager
+            self._initialize_effects_manager()
+
+            # Create GUI sections
+            self._create_header()
+            self._create_effect_controls()
+            self._create_color_controls()
+            self._create_per_key_editor()
+            self._create_preview_panel()
+            self._create_status_bar()
+
+            # Load settings
+            self._load_saved_settings()
+
+            # Start update thread
+            self._start_update_thread()
+
+            self.gui_initialized = True
+            self.logger.info("GUI initialization completed successfully")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize GUI: {e}")
+            return False
+
+    def stop_effect(self):
+        """Stop currently running effect"""
+        self._stop_update_thread.set()
+        self.logger.info("Effect stopped by user")
+
+    def run_wave_effect(self):
+        """Run wave effect across all keys"""
+        try:
+            color1 = 0xFF0000  # Red
+            color2 = 0x0000FF  # Blue
+            delay = max(0.01, 0.2 - self.speed_var.get() * 0.015)
+
+            for i in range(OSIRIS_KEY_COUNT):
+                if self._stop_update_thread.is_set():
+                    break
+                self.hardware.set_keys(i, [color1 if i % 2 == 0 else color2])
+                time.sleep(delay)
+                self.hardware.set_keys(i, [0x000000])
+        except Exception as e:
+            self.logger.error(f"Wave effect failed: {e}")
+
+    def run_pulse_effect(self):
+        """Run breathing pulse effect"""
+        try:
+            hex_color = self.color_button['bg'].lstrip('#')
+            base_color = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+            steps = 10
+            delay = max(0.01, 0.2 - self.speed_var.get() * 0.015)
+
+            for i in range(steps):
+                if self._stop_update_thread.is_set():
+                    break
+                brightness = int((i / steps) * 255)
+                r = base_color[0] * brightness // 255
+                g = base_color[1] * brightness // 255
+                b = base_color[2] * brightness // 255
+                hexval = (r << 16) | (g << 8) | b
+                self.hardware.clear_all(hexval)
+                time.sleep(delay)
+
+            for i in reversed(range(steps)):
+                if self._stop_update_thread.is_set():
+                    break
+                brightness = int((i / steps) * 255)
+                r = base_color[0] * brightness // 255
+                g = base_color[1] * brightness // 255
+                b = base_color[2] * brightness // 255
+                hexval = (r << 16) | (g << 8) | b
+                self.hardware.clear_all(hexval)
+                time.sleep(delay)
+        except Exception as e:
+            self.logger.error(f"Pulse effect failed: {e}")
+
+    def start_effect(self):
+        """Start selected effect"""
+        self._stop_update_thread.clear()
+        effect_name = self.effect_var.get()
+        self.logger.info(f"Starting effect: {effect_name}")
+
+        if effect_name == "Wave":
+            threading.Thread(target=self.run_wave_effect, daemon=True).start()
+        elif effect_name == "Pulse":
+            threading.Thread(target=self.run_pulse_effect, daemon=True).start()
+        elif effect_name == "Gradient":
+            threading.Thread(target=self.run_gradient_effect, daemon=True).start()
+        else:
+            success = self.effect_manager.start_effect(effect_name)
+            if not success:
+                self.logger.warning(f"Effect '{effect_name}' could not be started.")
+
+    def test_selected_effect(self):
+        """Run a quick preview of the selected effect"""
+        effect_name = self.effect_var.get()
+        self._stop_update_thread.clear()
+
+        if effect_name == "Wave":
+            threading.Thread(target=self.run_wave_effect, daemon=True).start()
+        elif effect_name == "Pulse":
+            threading.Thread(target=self.run_pulse_effect, daemon=True).start()
+        elif effect_name == "Gradient":
+            threading.Thread(target=self.run_gradient_effect, daemon=True).start()
+        else:
+            self.logger.warning(f"No preview available for: {effect_name}")
+
+    def load_keymap(self, path="keymap.json") -> Dict[str, int]:
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Failed to load keymap: {e}")
+            return {}
+
+    def run_gradient_effect(self):
+        """Run gradient sweep across keys"""
+        try:
+            hex_color = self.color_button['bg'].lstrip('#')
+            base_color = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+            for i in range(OSIRIS_KEY_COUNT):
+                if self._stop_update_thread.is_set():
+                    break
+                factor = i / OSIRIS_KEY_COUNT
+                r = int(base_color[0] * factor)
+                g = int(base_color[1] * factor)
+                b = int(base_color[2] * factor)
+                hexval = (r << 16) | (g << 8) | b
+                self.hardware.set_keys(i, [hexval])
+                time.sleep(0.02)
+        except Exception as e:
+            self.logger.error(f"Gradient effect failed: {e}")
+
+    def _apply_theme(self):
+        """Apply UI theme based on settings"""
+        theme_name = self.settings.get('theme', 'dark')
+        theme = UI_THEMES.get(theme_name, UI_THEMES['dark'])
+
+        self.root.configure(bg=theme['background'])
+
+        # Configure ttk styles
+        style = ttk.Style()
+        style.theme_use('clam')
+
+        # Configure colors for dark theme
+        style.configure('TFrame', background=theme['background'])
+        style.configure('TLabel', background=theme['background'], foreground=theme['foreground'])
+        style.configure('TButton', background=theme['accent'])
+        style.configure('TNotebook', background=theme['background'])
+        style.configure('TNotebook.Tab', background=theme['background'], foreground=theme['foreground'])
+
+    def _create_main_layout(self):
+        """Create main window layout"""
+        # Main container
+        self.main_frame = ttk.Frame(self.root, padding="10")
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Create notebook for tabbed interface
+        self.notebook = ttk.Notebook(self.main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        # Create tabs
+        self.effects_tab = ttk.Frame(self.notebook)
+        self.colors_tab = ttk.Frame(self.notebook)
+        self.per_key_tab = ttk.Frame(self.notebook)
+        self.settings_tab = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.effects_tab, text="Effects")
+        self.notebook.add(self.colors_tab, text="Colors")
+        self.notebook.add(self.per_key_tab, text="Per-Key Editor")
+        self.notebook.add(self.settings_tab, text="Settings")
+
+    def _initialize_hardware(self):
+        """Initialize hardware controller"""
+        try:
+            last_method = self.settings.get('last_control_method', 'ectool')
+            self.hardware = HardwareController(self.logger, last_method)
+
+            # Wait for hardware detection with timeout
+            if self.hardware.detection_complete.wait(timeout=10.0):
+                if self.hardware.hardware_ready:
+                    self.logger.info("Hardware initialized successfully")
+                else:
+                    self.logger.warning("Hardware detection completed but hardware not ready")
+            else:
+                self.logger.warning("Hardware detection timed out")
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize hardware: {e}")
+            self.hardware = None
+
+    def _initialize_effects_manager(self):
+        """Initialize effects manager"""
+        try:
+            self.effect_manager = EffectManager()
+            self.effect_manager.set_hardware_controller(self.hardware)
+            self.logger.info("Effects manager initialized")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize effects manager: {e}")
+
+    def _create_header(self):
+        """Create application header"""
+        header_frame = ttk.Frame(self.main_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # Title
+        title_label = ttk.Label(
+            header_frame,
+            text=f"{APP_NAME} v{VERSION}",
+            font=('Arial', 16, 'bold')
+        )
+        title_label.pack(side=tk.LEFT)
+
+        # Hardware status
+        self.hardware_status_label = ttk.Label(
+            header_frame,
+            text="Initializing...",
+            font=('Arial', 10)
+        )
+        self.hardware_status_label.pack(side=tk.RIGHT)
+
+        # Update hardware status
+        self._update_hardware_status()
+
+    def _create_effect_controls(self):
+        """Create effects control panel"""
+        # Effects frame
+        effects_frame = ttk.LabelFrame(self.effects_tab, text="Lighting Effects", padding="10")
+        effects_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Effect selection
+        effect_select_frame = ttk.Frame(effects_frame)
+        effect_select_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(effect_select_frame, text="Effect:").pack(side=tk.LEFT)
+
+        self.effect_var = tk.StringVar()
+        self.effect_combo = ttk.Combobox(
+            effect_select_frame,
+            textvariable=self.effect_var,
+            values=list(EFFECT_REGISTRY.keys()),
+            state="readonly",
+            width=20
+        )
+        self.effect_combo.pack(side=tk.LEFT, padx=(5, 10))
+        self.effect_combo.bind('<<ComboboxSelected>>', self.on_effect_changed)
+
+        # Start/Stop buttons
+        self.start_button = ttk.Button(
+            effect_select_frame,
+            text="Start Effect",
+            command=self.start_effect
+        )
+        self.start_button.pack(side=tk.LEFT, padx=5)
+
+
+        self.stop_button = ttk.Button(
+            effect_select_frame,
+            text="Stop Effect",
+            command=self.stop_effect
+        )
+        self.stop_button.pack(side=tk.LEFT, padx=5)
+
+        # Test Button
+        test_button = ttk.Button(
+            effect_select_frame,
+            text="Test Effect",
+            command=self.test_selected_effect
+        )
+        test_button.pack(side=tk.LEFT, padx=5)
+
+        # Effect parameters
+        params_frame = ttk.LabelFrame(effects_frame, text="Effect Parameters", padding="10")
+        params_frame.pack(fill=tk.X, pady=10)
+
+        # Speed control
+        speed_frame = ttk.Frame(params_frame)
+        speed_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(speed_frame, text="Speed:").pack(side=tk.LEFT)
+        self.speed_var = tk.IntVar(value=5)
+        self.speed_scale = ttk.Scale(
+            speed_frame,
+            from_=1, to=10,
+            variable=self.speed_var,
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        self.speed_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        self.speed_label = ttk.Label(speed_frame, text="5")
+        self.speed_label.pack(side=tk.LEFT)
+
+        self.speed_var.trace('w', lambda *args: self._update_speed_label())
+
+        # Brightness control
+        brightness_frame = ttk.Frame(params_frame)
+        brightness_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(brightness_frame, text="Brightness:").pack(side=tk.LEFT)
+        self.brightness_var = tk.IntVar(value=100)
+        self.brightness_scale = ttk.Scale(
+            brightness_frame,
+            from_=0, to=100,
+            variable=self.brightness_var,
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        self.brightness_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        self.brightness_label = ttk.Label(brightness_frame, text="100%")
+        self.brightness_label.pack(side=tk.LEFT)
+
+        self.brightness_var.trace('w', lambda *args: self._update_brightness_label())
+
+        # Primary color selection
+        color_frame = ttk.Frame(params_frame)
+        color_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(color_frame, text="Primary Color:").pack(side=tk.LEFT)
+
+        self.color_button = tk.Button(
+            color_frame,
+            text="Select Color",
+            bg="#FFFFFF",
+            width=15,
+            command=self.select_primary_color
+        )
+        self.color_button.pack(side=tk.LEFT, padx=(5, 10))
+
+        # Color presets
+        self.preset_var = tk.StringVar()
+        self.preset_combo = ttk.Combobox(
+            color_frame,
+            textvariable=self.preset_var,
+            values=list(COLOR_PRESETS.keys()),
+            state="readonly",
+            width=15
+        )
+        self.preset_combo.pack(side=tk.LEFT, padx=5)
+        self.preset_combo.bind('<<ComboboxSelected>>', self.on_preset_selected)
+
+    def _create_color_controls(self):
+        """Create color control panel"""
+        # Zone colors frame
+        zone_frame = ttk.LabelFrame(self.colors_tab, text="Zone Colors", padding="10")
+        zone_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.zone_color_buttons = []
+        for i in range(4):  # 4 logical zones
+            frame = ttk.Frame(zone_frame)
+            frame.pack(fill=tk.X, pady=2)
+
+            ttk.Label(frame, text=f"Zone {i+1}:").pack(side=tk.LEFT)
+
+            button = tk.Button(
+                frame,
+                text=f"Zone {i+1} Color",
+                bg="#FFFFFF",
+                width=15,
+                command=lambda idx=i: self.select_zone_color(idx)
+            )
+            button.pack(side=tk.LEFT, padx=(5, 10))
+            self.zone_color_buttons.append(button)
+
+        # Gaming profiles frame
+        gaming_frame = ttk.LabelFrame(self.colors_tab, text="Gaming Profiles", padding="10")
+        gaming_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        profile_frame = ttk.Frame(gaming_frame)
+        profile_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(profile_frame, text="Profile:").pack(side=tk.LEFT)
+
+        self.gaming_profile_var = tk.StringVar()
+        self.gaming_profile_combo = ttk.Combobox(
+            profile_frame,
+            textvariable=self.gaming_profile_var,
+            values=list(GAMING_COLOR_PROFILES.keys()),
+            state="readonly",
+            width=20
+        )
+        self.gaming_profile_combo.pack(side=tk.LEFT, padx=(5, 10))
+
+        apply_profile_button = ttk.Button(
+            profile_frame,
+            text="Apply Profile",
+            command=self.apply_gaming_profile
+        )
+        apply_profile_button.pack(side=tk.LEFT, padx=5)
+
+    def _create_per_key_editor(self):
+        """Create per-key color editor"""
+        # Instructions
+        instructions = ttk.Label(
+            self.per_key_tab,
+            text="Click on keys to customize their colors individually",
+            font=('Arial', 10, 'italic')
+        )
+        instructions.pack(pady=(10, 5))
+
+        # Keyboard layout canvas
+        self.keyboard_canvas = tk.Canvas(
+            self.per_key_tab,
+            width=800,
+            height=300,
+            bg='#2c2c2c'
+        )
+        self.keyboard_canvas.pack(pady=10)
+
+        # Draw keyboard layout
+        self._draw_keyboard_layout()
+
+        # Per-key controls
+        controls_frame = ttk.Frame(self.per_key_tab)
+        controls_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # Selected key info
+        ttk.Label(controls_frame, text="Selected Key:").pack(side=tk.LEFT)
+        self.selected_key_label = ttk.Label(controls_frame, text="None", font=('Arial', 10, 'bold'))
+        self.selected_key_label.pack(side=tk.LEFT, padx=(5, 20))
+
+        # Color selection for selected key
+        self.selected_color_button = tk.Button(
+            controls_frame,
+            text="Set Key Color",
+            bg="#FFFFFF",
+            width=15,
+            command=self.set_selected_key_color,
+            state=tk.DISABLED
+        )
+        self.selected_color_button.pack(side=tk.LEFT, padx=5)
+
+        # Clear/Reset options
+        reset_frame = ttk.Frame(self.per_key_tab)
+        reset_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Button(
+            reset_frame,
+            text="Clear All Keys",
+            command=self.clear_all_keys
+        ).pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(
+            reset_frame,
+            text="Reset to Default",
+            command=self.reset_per_key_colors
+        ).pack(side=tk.LEFT, padx=5)
+
+        # Save/Load options
+        ttk.Button(
+            reset_frame,
+            text="Save Layout",
+            command=self.save_per_key_layout
+        ).pack(side=tk.RIGHT, padx=5)
+
+        ttk.Button(
+            reset_frame,
+            text="Load Layout",
+            command=self.load_per_key_layout
+        ).pack(side=tk.RIGHT, padx=5)
+
+        # Track selected key
+        self.selected_key_id = None
+        self.keyboard_canvas.bind('<Button-1>', self.on_key_click)
+
+    def _create_preview_panel(self):
+        """Create lighting preview panel"""
+        preview_frame = ttk.LabelFrame(self.main_frame, text="Live Preview", padding="10")
+        preview_frame.pack(fill=tk.X, pady=(5, 0))
+
+        # Preview canvas
+        self.preview_canvas = tk.Canvas(
+            preview_frame,
+            width=PREVIEW_WIDTH,
+            height=PREVIEW_HEIGHT,
+            bg='#1a1a1a'
+        )
+        self.preview_canvas.pack()
+
+        # Preview controls
+        preview_controls = ttk.Frame(preview_frame)
+        preview_controls.pack(fill=tk.X, pady=(5, 0))
+
+        self.preview_enabled_var = tk.BooleanVar(value=True)
+        preview_check = ttk.Checkbutton(
+            preview_controls,
+            text="Enable Preview",
+            variable=self.preview_enabled_var
+        )
+        preview_check.pack(side=tk.LEFT)
+
+        # Performance info
+        self.performance_label = ttk.Label(
+            preview_controls,
+            text="FPS: --",
+            font=('Arial', 9)
+        )
+        self.performance_label.pack(side=tk.RIGHT)
+
+    def _create_status_bar(self):
+        """Create status bar"""
+        self.status_bar = ttk.Label(
+            self.main_frame,
+            text="Ready",
+            relief=tk.SUNKEN,
+            anchor=tk.W,
+            padding="5"
+        )
+        self.status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _draw_keyboard_layout(self):
+        """Draw keyboard layout on canvas"""
+        self.key_rectangles = {}
+
+        key_width = 45
+        key_height = 35
+        key_spacing = 5
+        start_x = 20
+        start_y = 20
+
+        # Define keyboard rows
+        keyboard_rows = [
+            # Function row (F1-F10)
+            [(i, f'F{i+1}') for i in range(10)],
+            # Number row
+            [(10, '`')] + [(11+i, str(i+1)) for i in range(9)] + [(20, '0'), (21, '-'), (22, '='), (23, 'Bksp')],
+            # QWERTY row
+            [(24, 'Tab')] + [(25+i, c) for i, c in enumerate('QWERTYUIOP')] + [(35, '['), (36, ']'), (37, '\\')],
+            # ASDF row
+            [(38, 'Caps')] + [(39+i, c) for i, c in enumerate('ASDFGHJKL')] + [(48, ';'), (49, "'"), (50, 'Enter')],
+            # ZXCV row
+            [(51, 'Shift')] + [(52+i, c) for i, c in enumerate('ZXCVBNM')] + [(59, ','), (60, '.'), (61, '/'), (62, 'Shift')],
+            # Bottom row
+            [(63, 'Ctrl'), (64, 'Fn'), (65, 'Alt'), (66, 'Space'), (67, 'Alt'), (68, 'Ctrl'), (69, '↑'), (70, '↓'), (71, '←'), (72, '→')]
+        ]
+
+        # Draw keys
+        for row_idx, row in enumerate(keyboard_rows):
+            current_y = start_y + row_idx * (key_height + key_spacing)
+            current_x = start_x
+
+            for key_id, key_label in row:
+                # Special width handling
+                if key_label in ['Space']:
+                    width = key_width * 6
+                elif key_label in ['Enter', 'Bksp', 'Tab', 'Caps', 'Shift']:
+                    width = key_width * 1.5
+                else:
+                    width = key_width
+
+                # Draw key rectangle
+                rect = self.keyboard_canvas.create_rectangle(
+                    current_x, current_y,
+                    current_x + width, current_y + key_height,
+                    fill='#404040', outline='#606060', width=2
+                )
+
+                # Draw key label
+                text = self.keyboard_canvas.create_text(
+                    current_x + width/2, current_y + key_height/2,
+                    text=key_label, fill='white', font=('Arial', 8, 'bold')
+                )
+
+                # Store key info
+                self.key_rectangles[key_id] = {
+                    'rect': rect,
+                    'text': text,
+                    'label': key_label,
+                    'x': current_x,
+                    'y': current_y,
+                    'width': width,
+                    'height': key_height
+                }
+
+                current_x += width + key_spacing
+
+    def _create_settings_tab(self):
+        """Create settings tab"""
+        # Hardware settings
+        hw_frame = ttk.LabelFrame(self.settings_tab, text="Hardware Settings", padding="10")
+        hw_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Control method selection
+        method_frame = ttk.Frame(hw_frame)
+        method_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(method_frame, text="Control Method:").pack(side=tk.LEFT)
+
+        self.control_method_var = tk.StringVar(value=self.settings.get('last_control_method', 'ectool'))
+        method_combo = ttk.Combobox(
+            method_frame,
+            textvariable=self.control_method_var,
+            values=['ectool', 'ec_direct'],
+            state="readonly",
+            width=15
+        )
+        method_combo.pack(side=tk.LEFT, padx=(5, 10))
+        method_combo.bind('<<ComboboxSelected>>', self.on_control_method_changed)
+
+        # Hardware detection
+        detect_button = ttk.Button(
+            method_frame,
+            text="Detect Hardware",
+            command=self.detect_hardware
+        )
+        detect_button.pack(side=tk.LEFT, padx=5)
+
+        # Application settings
+        app_frame = ttk.LabelFrame(self.settings_tab, text="Application Settings", padding="10")
+        app_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Theme selection
+        theme_frame = ttk.Frame(app_frame)
+        theme_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(theme_frame, text="Theme:").pack(side=tk.LEFT)
+
+        self.theme_var = tk.StringVar(value=self.settings.get('theme', 'dark'))
+        theme_combo = ttk.Combobox(
+            theme_frame,
+            textvariable=self.theme_var,
+            values=list(UI_THEMES.keys()),
+            state="readonly",
+            width=15
+        )
+        theme_combo.pack(side=tk.LEFT, padx=(5, 10))
+        theme_combo.bind('<<ComboboxSelected>>', self.on_theme_changed)
+
+        # Startup options
+        startup_frame = ttk.Frame(app_frame)
+        startup_frame.pack(fill=tk.X, pady=5)
+
+        self.restore_on_startup_var = tk.BooleanVar(value=self.settings.get('restore_on_startup', True))
+        restore_check = ttk.Checkbutton(
+            startup_frame,
+            text="Restore lighting on startup",
+            variable=self.restore_on_startup_var,
+            command=self.on_startup_option_changed
+        )
+        restore_check.pack(side=tk.LEFT)
+
+        self.minimize_to_tray_var = tk.BooleanVar(value=self.settings.get('minimize_to_tray', True))
+        tray_check = ttk.Checkbutton(
+            startup_frame,
+            text="Minimize to system tray",
+            variable=self.minimize_to_tray_var,
+            command=self.on_startup_option_changed
+        )
+        tray_check.pack(side=tk.LEFT, padx=(20, 0))
+
+    def _load_saved_settings(self):
+        """Load saved settings into UI"""
+        try:
+            # Load effect settings
+            effect_name = self.settings.get('effect_name', 'Static Color')
+            if effect_name in EFFECT_REGISTRY:
+                self.effect_var.set(effect_name)
+
+            # Load parameters
+            self.speed_var.set(self.settings.get('effect_speed', 5))
+            self.brightness_var.set(self.settings.get('effect_brightness', 100))
+
+            # Load colors
+            effect_color = self.settings.get('effect_color', '#FFFFFF')
+            self.color_button.configure(bg=effect_color)
+
+            # Update zone color buttons
+            zone_colors = self.settings.get('zone_colors', [])
+            for i, button in enumerate(self.zone_color_buttons):
+                if i < len(zone_colors):
+                    color = zone_colors[i]
+                    hex_color = f"#{color['r']:02X}{color['g']:02X}{color['b']:02X}"
+                    button.configure(bg=hex_color)
+
+            self.logger.info("Settings loaded successfully")
+
+        except Exception as e:
+            self.logger.error(f"Failed to load settings: {e}")
+
+    def _start_update_thread(self):
+        """Start GUI update thread"""
+        self._update_thread = threading.Thread(target=self._update_loop, daemon=True)
+        self._update_thread.start()
+
+    def _update_loop(self):
+        """Main GUI update loop"""
+        frame_count = 0
+        last_fps_time = time.time()
+
+        while not self._stop_update_thread.is_set():
+            try:
+                if self.gui_initialized and self.preview_enabled_var.get():
+                    # Update preview
+                    self._update_preview()
+
+                    # Update performance stats
+                    frame_count += 1
+                    current_time = time.time()
+
+                    if current_time - last_fps_time >= 1.0:  # Update FPS every second
+                        fps = frame_count / (current_time - last_fps_time)
+                        if self.performance_label:
+                            self.performance_label.configure(text=f"FPS: {fps:.1f}")
+
+                        frame_count = 0
+                        last_fps_time = current_time
+
+                # Update hardware status
+                self._update_hardware_status()
+
+                time.sleep(1/30)  # 30 FPS update rate
+
+            except Exception as e:
+                self.logger.error(f"Error in update loop: {e}")
+                time.sleep(0.1)
+
+    def _update_preview(self):
+        """Update lighting preview"""
+        if not self.preview_canvas:
+            return
+
+        try:
+            # Get current colors from effect manager
+            if self.effect_manager and self.effect_manager.is_effect_running():
+                colors = self.effect_manager.get_current_colors()
+                if colors:
+                    self.current_colors = colors
+
+            # Draw preview
+            self._draw_preview()
+
+        except Exception as e:
+            self.logger.error(f"Error updating preview: {e}")
+
+    def _draw_preview(self):
+        """Draw preview on canvas"""
+        if not self.preview_canvas:
+            return
+
+        self.preview_canvas.delete("preview_key")
+
+        # Calculate layout
+        keys_per_row = 14
+        key_width = PREVIEW_WIDTH // keys_per_row - 2
+        key_height = 20
+
+        for i, color in enumerate(self.current_colors):
+            row = i // keys_per_row
+            col = i % keys_per_row
+
+            x1 = col * (key_width + 2) + 5
+            y1 = row * (key_height + 2) + 5
+            x2 = x1 + key_width
+            y2 = y1 + key_height
+
+            # Convert RGBColor to hex
+            hex_color = color.to_hex() if isinstance(color, RGBColor) else "#000000"
+
+            self.preview_canvas.create_rectangle(
+                x1, y1, x2, y2,
+                fill=hex_color,
+                outline="#666666",
+                tags="preview_key"
+            )
+
+    def _update_hardware_status(self):
+        """Update hardware status display"""
+        if not self.hardware_status_label:
+            return
+
+        try:
+            if self.hardware and self.hardware.is_operational():
+                status = f"✓ {self.hardware.active_control_method.upper()}"
+                if hasattr(self.hardware, 'is_osiris_hardware') and self.hardware.is_osiris_hardware:
+                    status += " (OSIRIS)"
+            else:
+                status = "⚠ Hardware not detected"
+
+            self.hardware_status_label.configure(text=status)
+
+        except Exception as e:
+            self.hardware_status_label.configure(text="⚠ Error")
+
+    # Event handlers
+    def on_effect_changed(self, event=None):
+        """Handle effect selection change"""
+        try:
+            effect_name = self.effect_var.get()
+            if effect_name in EFFECT_REGISTRY:
+                self.settings.set('effect_name', effect_name)
+                self.logger.info(f"Effect changed to: {effect_name}")
+        except Exception as e:
+            self.logger.error(f"Error changing effect: {e}")
+
+    def on_preset_selected(self, event=None):
+        """Handle color preset selection"""
+        try:
+            preset_name = self.preset_var.get()
+            if preset_name in COLOR_PRESETS:
+                hex_color = COLOR_PRESETS[preset_name]
+                self.color_button.configure(bg=hex_color)
+                self.settings.set('effect_color', hex_color)
+                self.logger.info(f"Color preset applied: {preset_name}")
+        except Exception as e:
+            self.logger.error(f"Error applying preset: {e}")
+
+    def on_control_method_changed(self, event=None):
+        """Handle control method change"""
+        try:
+            method = self.control_method_var.get()
+            self.settings.set('last_control_method', method)
+
+            # Reinitialize hardware with new method
+            if self.hardware:
+                self.hardware.set_control_method(method)
+
+            self.logger.info(f"Control method changed to: {method}")
+        except Exception as e:
+            self.logger.error(f"Error changing control method: {e}")
+
+    def on_theme_changed(self, event=None):
+        """Handle theme change"""
+        try:
+            theme = self.theme_var.get()
+            self.settings.set('theme', theme)
+            self._apply_theme()
+            self.logger.info(f"Theme changed to: {theme}")
+        except Exception as e:
+            self.logger.error(f"Error changing theme: {e}")
+
+    def on_startup_option_changed(self):
+        """Handle startup options change"""
+        self.settings.update({
+            'restore_on_startup': self.restore_on_startup_var.get(),
+            'minimize_to_tray': self.minimize_to_tray_var.get()
+        })
+
+    def on_key_click(self, event):
+        """Handle key click in per-key editor"""
+        try:
+            # Find clicked key
+            clicked_item = self.keyboard_canvas.find_closest(event.x, event.y)[0]
+
+            for key_id, key_info in self.key_rectangles.items():
+                if key_info['rect'] == clicked_item:
+                    self.selected_key_id = key_id
+                    self.selected_key_label.configure(text=key_info['label'])
+                    self.selected_color_button.configure(state=tk.NORMAL)
+
+                    # Highlight selected key
+                    self.keyboard_canvas.itemconfig(clicked_item, outline='#00FF00', width=3)
+
+                    # Remove highlight from other keys
+                    for other_id, other_info in self.key_rectangles.items():
+                        if other_id != key_id:
+                            self.keyboard_canvas.itemconfig(other_info['rect'], outline='#606060', width=2)
+
+                    break
+
+        except Exception as e:
+            self.logger.error(f"Error handling key click: {e}")
+
+    def on_closing(self):
+        """Handle window closing"""
+        if self.closing:
+            return
+
+        self.closing = True
+
+        try:
+            # Stop update thread
+            self._stop_update_thread.set()
+
+            # Stop effects
+            if self.effect_manager:
+                self.effect_manager.stop_effect()
+
+            # Save settings
+            self.settings.mark_clean_shutdown()
+
+            # Cleanup hardware
+            if self.hardware:
+                self.hardware.cleanup()
+
+            self.logger.info("Application closing gracefully")
+
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
+
+        finally:
+            if self.root:
+                self.root.destroy()
+
+    # Control methods
+    def start_effect(self):
+        """Start selected effect"""
+        self._stop_update_thread.clear()
+        effect_name = self.effect_var.get()
+        self.logger.info(f"Starting effect: {effect_name}")
+
+        if effect_name == "Wave":
+            threading.Thread(target=self.run_wave_effect, daemon=True).start()
+        elif effect_name == "Pulse":
+            threading.Thread(target=self.run_pulse_effect, daemon=True).start()
+        elif effect_name == "Gradient":
+            threading.Thread(target=self.run_gradient_effect, daemon=True).start()
+        else:
+            success = self.effect_manager.start_effect(effect_name)
+            if not success:
+                self.logger.warning(f"Effect '{effect_name}' could not be started.")
+
+    def stop_effect(self):
+        """Stop current effect"""
+        try:
+            if self.effect_manager:
+                self.effect_manager.stop_effect()
+                self.current_effect = None
+                self.status_bar.configure(text="Effect stopped")
+
+        except Exception as e:
+            self.logger.error(f"Error stopping effect: {e}")
+
+    def load_keymap(self, path="keymap.json") -> Dict[str, int]:
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Failed to load keymap: {e}")
+            return {}
+
+
+    def run_wave_effect(self, color1=0xFF0000, color2=0x0000FF, delay=0.05):
+    """Run wave effect across all keys"""
+    try:
+        for i in range(OSIRIS_KEY_COUNT):
+            if self._stop_update_thread.is_set():
+                break
+            self.hardware.set_keys(i, [color1 if i % 2 == 0 else color2])
+            time.sleep(delay)
+            self.hardware.set_keys(i, [0x000000])
+    except Exception as e:
+        self.logger.error(f"Wave effect failed: {e}")
+
+def run_pulse_effect(self, base_color=(255, 0, 0), steps=10, delay=0.1):
+    """Run breathing pulse effect"""
+    try:
+        for i in range(steps):
+            if self._stop_update_thread.is_set():
+            break
+            brightness = int((i / steps) * 255)
+            r = base_color[0] * brightness // 255
+            g = base_color[1] * brightness // 255
+            b = base_color[2] * brightness // 255
+            hexval = (r << 16) | (g << 8) | b
+            self.hardware.clear_all(hexval)
+            time.sleep(delay)
+        for i in reversed(range(steps)):
+            if self._stop_update_thread.is_set():
+            break
+            brightness = int((i / steps) * 255)
+            r = base_color[0] * brightness // 255
+            g = base_color[1] * brightness // 255
+            b = base_color[2] * brightness // 255
+            hexval = (r << 16) | (g << 8) | b
+            self.hardware.clear_all(hexval)
+            time.sleep(delay)
+    except Exception as e:
+        self.logger.error(f"Pulse effect failed: {e}")
+
+def run_gradient_effect(self, base_color=(0, 255, 0)):
+    """Run gradient sweep across keys"""
+    try:
+        for i in range(OSIRIS_KEY_COUNT):
+            if self._stop_update_thread.is_set():
+            break
+            factor = i / OSIRIS_KEY_COUNT
+            r = int(base_color[0] * factor)
+            g = int(base_color[1] * factor)
+            b = int(base_color[2] * factor)
+            hexval = (r << 16) | (g << 8) | b
+            self.hardware.set_keys(i, [hexval])
+            time.sleep(0.02)
+    except Exception as e:
+        self.logger.error(f"Gradient effect failed: {e}")
+
+    def select_primary_color(self):
+        """Select primary effect color"""
+        try:
+            current_color = self.color_button['bg']
+            color = colorchooser.askcolor(color=current_color, title="Select Primary Color")
+
+            if color[1]:  # If color was selected
+                self.color_button.configure(bg=color[1])
+                self.settings.set('effect_color', color[1])
+
+        except Exception as e:
+            self.logger.error(f"Error selecting color: {e}")
+
+    def select_zone_color(self, zone_index):
+        """Select color for specific zone"""
+        try:
+            current_color = self.zone_color_buttons[zone_index]['bg']
+            color = colorchooser.askcolor(color=current_color, title=f"Select Zone {zone_index+1} Color")
+
+            if color[1]:  # If color was selected
+                self.zone_color_buttons[zone_index].configure(bg=color[1])
+
+                # Update settings
+                zone_colors = self.settings.get('zone_colors', [])
+                rgb = RGBColor.from_hex(color[1])
+
+                while len(zone_colors) <= zone_index:
+                    zone_colors.append({"r": 255, "g": 255, "b": 255})
+
+                zone_colors[zone_index] = rgb.to_dict()
+                self.settings.set('zone_colors', zone_colors)
+
+        except Exception as e:
+            self.logger.error(f"Error selecting zone color: {e}")
+
+    def apply_gaming_profile(self):
+        """Apply selected gaming profile"""
+        try:
+            profile_name = self.gaming_profile_var.get()
+            if profile_name not in GAMING_COLOR_PROFILES:
+                return
+
+            profile = GAMING_COLOR_PROFILES[profile_name]
+
+            # Apply profile colors to per-key layout
+            for key_group, color_hex in profile.items():
+                if key_group == 'Default':
+                    continue
+
+                # Apply to specific key groups
+                # This would need key group mapping implementation
+
+            messagebox.showinfo("Success", f"Gaming profile '{profile_name}' applied")
+
+        except Exception as e:
+            self.logger.error(f"Error applying gaming profile: {e}")
+            messagebox.showerror("Error", f"Failed to apply profile: {e}")
+
+    def set_selected_key_color(self):
+        """Set color for selected key"""
+        if self.selected_key_id is None:
+            return
+
+        try:
+            color = colorchooser.askcolor(title=f"Select Color for Key {self.selected_key_id}")
+
+            if color[1]:  # If color was selected
+                # Update key visualization
+                key_info = self.key_rectangles[self.selected_key_id]
+                self.keyboard_canvas.itemconfig(key_info['rect'], fill=color[1])
+
+                # Update per-key colors in settings
+                per_key_colors = self.settings.get('per_key_colors', {})
+                rgb = RGBColor.from_hex(color[1])
+                per_key_colors[str(self.selected_key_id)] = rgb.to_dict()
+                self.settings.set('per_key_colors', per_key_colors)
+
+        except Exception as e:
+            self.logger.error(f"Error setting key color: {e}")
+
+    def clear_all_keys(self):
+        """Clear all per-key colors"""
+        try:
+            # Reset all keys to default color
+            for key_id, key_info in self.key_rectangles.items():
+                self.keyboard_canvas.itemconfig(key_info['rect'], fill='#404040')
+
+            # Clear settings
+            self.settings.set('per_key_colors', {})
+            messagebox.showinfo("Success", "All key colors cleared")
+
+        except Exception as e:
+            self.logger.error(f"Error clearing keys: {e}")
+
+    def reset_per_key_colors(self):
+        """Reset per-key colors to default"""
+        try:
+            # Reset to white
+            default_colors = {str(i): {"r": 255, "g": 255, "b": 255} for i in range(OSIRIS_KEY_COUNT)}
+            self.settings.set('per_key_colors', default_colors)
+
+            # Update visualization
+            for key_id, key_info in self.key_rectangles.items():
+                self.keyboard_canvas.itemconfig(key_info['rect'], fill='#FFFFFF')
+
+            messagebox.showinfo("Success", "Per-key colors reset to default")
+
+        except Exception as e:
+            self.logger.error(f"Error resetting keys: {e}")
+
+    def save_per_key_layout(self):
+        """Save per-key layout to file"""
+        try:
+            filename = filedialog.asksaveasfilename(
+                title="Save Per-Key Layout",
+                defaultextension=".json",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            )
+
+            if filename:
+                per_key_colors = self.settings.get('per_key_colors', {})
+
+                layout_data = {
+                    'version': VERSION,
+                    'type': 'per_key_layout',
+                    'colors': per_key_colors,
+                    'created': time.strftime('%Y-%m-%d %H:%M:%S')
+                }
+
+                with open(filename, 'w') as f:
+                    json.dump(layout_data, f, indent=2)
+
+                messagebox.showinfo("Success", f"Layout saved to {filename}")
+
+        except Exception as e:
+            self.logger.error(f"Error saving layout: {e}")
+            messagebox.showerror("Error", f"Failed to save layout: {e}")
+
+    def load_per_key_layout(self):
+        """Load per-key layout from file"""
+        try:
+            filename = filedialog.askopenfilename(
+                title="Load Per-Key Layout",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            )
+
+            if filename:
+                with open(filename, 'r') as f:
+                    layout_data = json.load(f)
+
+                if layout_data.get('type') == 'per_key_layout':
+                    colors = layout_data.get('colors', {})
+                    self.settings.set('per_key_colors', colors)
+
+                    # Update visualization
+                    for key_id_str, color_dict in colors.items():
+                        key_id = int(key_id_str)
+                        if key_id in self.key_rectangles:
+                            hex_color = f"#{color_dict['r']:02X}{color_dict['g']:02X}{color_dict['b']:02X}"
+                            self.keyboard_canvas.itemconfig(self.key_rectangles[key_id]['rect'], fill=hex_color)
+
+                    messagebox.showinfo("Success", f"Layout loaded from {filename}")
+                else:
+                    messagebox.showerror("Error", "Invalid layout file format")
+
+        except Exception as e:
+            self.logger.error(f"Error loading layout: {e}")
+            messagebox.showerror("Error", f"Failed to load layout: {e}")
+
+    def detect_hardware(self):
+        """Detect hardware"""
+        try:
+            if self.hardware:
+                self.hardware.detect_hardware()
+                self.status_bar.configure(text="Hardware detection started...")
+
+        except Exception as e:
+            self.logger.error(f"Error detecting hardware: {e}")
+
+    def _update_speed_label(self):
+        """Update speed label"""
+        self.speed_label.configure(text=str(self.speed_var.get()))
+
+    def _update_brightness_label(self):
+        """Update brightness label"""
+        self.brightness_label.configure(text=f"{self.brightness_var.get()}%")
+
+    def test_hardware(self) -> Dict[str, Any]:
+        """Test hardware functionality"""
+        try:
+            if not self.hardware:
+                return {'overall_success': False, 'error_messages': ['Hardware not initialized']}
+
+            return self.hardware.test_hardware()
+
+        except Exception as e:
+            return {'overall_success': False, 'error_messages': [str(e)]}
+
+    def test_selected_effect(self):
+        """Run a quick preview of the selected effect"""
+        effect_name = self.effect_var.get()
+        self._stop_update_thread.clear()
+
+        if effect_name == "Wave":
+            threading.Thread(target=self.run_wave_effect, daemon=True).start()
+        elif effect_name == "Pulse":
+            threading.Thread(target=self.run_pulse_effect, daemon=True).start()
+        elif effect_name == "Gradient":
+            threading.Thread(target=self.run_gradient_effect, daemon=True).start()
+        else:
+            self.logger.warning(f"No preview available for: {effect_name}")
+
+    def load_keymap(self, path="keymap.json") -> Dict[str, int]:
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            self.logger.warning(f"Failed to load keymap: {e}")
+            return {}
+
+
+    def set_brightness(self, brightness: int) -> bool:
+        """Set keyboard brightness"""
+        try:
+            if self.hardware:
+                return self.hardware.set_brightness(brightness)
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Error setting brightness: {e}")
+            return False
+
+    def set_color(self, color: RGBColor) -> bool:
+        """Set keyboard color"""
+        try:
+            if self.hardware:
+                return self.hardware.set_all_leds_color(color)
+            return False
+
+        except Exception as e:
+            self.logger.error(f"Error setting color: {e}")
+            return False
+
+    def run(self):
+        """Run the GUI main loop"""
+        if not self.gui_initialized:
+            raise RuntimeError("GUI not initialized. Call initialize_gui() first.")
+
+        try:
+            self.logger.info("Starting GUI main loop")
+            self.root.mainloop()
+        except Exception as e:
+            self.logger.error(f"Error in main loop: {e}")
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        """Cleanup resources"""
+        try:
+            self.logger.info("Cleaning up RGB Controller...")
+
+            # Stop update thread
+            self._stop_update_thread.set()
+
+            # Stop effects
+            if self.effect_manager:
+                self.effect_manager.cleanup()
+
+            # Cleanup hardware
+            if self.hardware:
+                self.hardware.cleanup()
+
+            # Save settings
+            if self.settings:
+                self.settings.cleanup()
+
+            self.logger.info("RGB Controller cleanup completed")
+
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {e}")
+
+# Convenience function for main application
+def create_rgb_controller(settings_manager=None, logger=None) -> RGBController:
+    """Create RGB Controller instance"""
+    return RGBController(settings_manager, logger)
+
+
+class SystemTrayIcon:
+    """System tray icon for minimized application"""
+
+    def __init__(self, controller: RGBController):
+        """Initialize system tray icon"""
+        self.controller = controller
+        self.tray_icon = None
+        self.menu = None
+
+        # Try to import system tray libraries
+        try:
+            import pystray
+            from PIL import Image
+            self.pystray = pystray
+            self.PIL_Image = Image
+            self.tray_available = True
+        except ImportError:
+            self.tray_available = False
+            self.controller.logger.warning("System tray not available - pystray or PIL not installed")
+
+    def create_tray_icon(self):
+        """Create system tray icon"""
+        if not self.tray_available:
+            return False
+
+        try:
+            # Create simple icon image
+            image = self.PIL_Image.new('RGB', (64, 64), color='black')
+
+            # Create menu
+            menu = self.pystray.Menu(
+                self.pystray.MenuItem("Show", self.show_window, default=True),
+                self.pystray.MenuItem("Effects", self.pystray.Menu(
+                    self.pystray.MenuItem("Static Color", lambda: self.quick_effect("Static Color")),
+                    self.pystray.MenuItem("Breathing", lambda: self.quick_effect("Breathing")),
+                    self.pystray.MenuItem("Rainbow Wave", lambda: self.quick_effect("Rainbow Wave")),
+                    self.pystray.MenuItem("Stop Effect", self.stop_effect)
+                )),
+                self.pystray.MenuItem("Settings", self.show_settings),
+                self.pystray.MenuItem("Exit", self.quit_application)
+            )
+
+            # Create tray icon
+            self.tray_icon = self.pystray.Icon(
+                APP_NAME,
+                image,
+                menu=menu
+            )
+
+            return True
+
+        except Exception as e:
+            self.controller.logger.error(f"Failed to create tray icon: {e}")
+            return False
+
+    def show_tray_icon(self):
+        """Show system tray icon"""
+        if self.tray_icon:
+            self.tray_icon.run_detached()
+
+    def hide_tray_icon(self):
+        """Hide system tray icon"""
+        if self.tray_icon:
+            self.tray_icon.stop()
+
+    def show_window(self, icon=None, item=None):
+        """Show main window from tray"""
+        if self.controller.root:
+            self.controller.root.deiconify()
+            self.controller.root.lift()
+            self.controller.root.focus_force()
+
+    def show_settings(self, icon=None, item=None):
+        """Show settings tab"""
+        self.show_window()
+        if self.controller.notebook:
+            self.controller.notebook.select(self.controller.settings_tab)
+
+    def quick_effect(self, effect_name: str):
+        """Quick effect activation from tray"""
+        try:
+            if self.controller.effect_manager:
+                self.controller.effect_manager.start_effect(effect_name)
+        except Exception as e:
+            self.controller.logger.error(f"Error starting effect from tray: {e}")
+
+    def stop_effect(self, icon=None, item=None):
+        """Stop current effect from tray"""
+        try:
+            if self.controller.effect_manager:
+                self.controller.effect_manager.stop_effect()
+        except Exception as e:
+            self.controller.logger.error(f"Error stopping effect from tray: {e}")
+
+    def quit_application(self, icon=None, item=None):
+        """Quit application from tray"""
+        if self.controller.root:
+            self.controller.root.quit()
+
+
+class KeyboardLayoutVisualization:
+    """Advanced keyboard layout visualization with per-key precision"""
+
+    def __init__(self, canvas: tk.Canvas, controller: RGBController):
+        """Initialize keyboard visualization"""
+        self.canvas = canvas
+        self.controller = controller
+        self.key_objects = {}  # Store key visual objects
+        self.key_positions = {}  # Store key positions for calculations
+
+        # Visual parameters
+        self.base_key_width = 40
+        self.base_key_height = 30
+        self.key_spacing = 3
+        self.corner_radius = 4
+
+        # Animation state
+        self.animation_frame = 0
+        self.animation_running = False
+
+        self._create_detailed_layout()
+
+    def _create_detailed_layout(self):
+        """Create detailed keyboard layout with proper key positioning"""
+        self.canvas.delete("all")
+
+        # Define precise key layout based on OSIRIS hardware
+        key_layout = [
+            # Function row
+            {
+                'keys': [f'F{i}' for i in range(1, 11)],
+                'start_x': 40,
+                'y': 20,
+                'key_ids': list(range(0, 10)),
+                'widths': [self.base_key_width] * 10
+            },
+            # Number row
+            {
+                'keys': ['`', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 'Backspace'],
+                'start_x': 20,
+                'y': 60,
+                'key_ids': list(range(10, 24)),
+                'widths': [self.base_key_width] * 13 + [self.base_key_width * 1.5]
+            },
+            # QWERTY row
+            {
+                'keys': ['Tab'] + list('QWERTYUIOP') + ['[', ']', '\\'],
+                'start_x': 20,
+                'y': 100,
+                'key_ids': list(range(24, 38)),
+                'widths': [self.base_key_width * 1.2] + [self.base_key_width] * 12 + [self.base_key_width * 1.2]
+            },
+            # ASDF row
+            {
+                'keys': ['Caps'] + list('ASDFGHJKL') + [';', "'", 'Enter'],
+                'start_x': 20,
+                'y': 140,
+                'key_ids': list(range(38, 51)),
+                'widths': [self.base_key_width * 1.4] + [self.base_key_width] * 10 + [self.base_key_width * 1.6]
+            },
+            # ZXCV row
+            {
+                'keys': ['Shift'] + list('ZXCVBNM') + [',', '.', '/', 'Shift'],
+                'start_x': 20,
+                'y': 180,
+                'key_ids': list(range(51, 63)),
+                'widths': [self.base_key_width * 1.8] + [self.base_key_width] * 9 + [self.base_key_width * 1.8]
+            },
+            # Bottom row
+            {
+                'keys': ['Ctrl', 'Fn', 'Alt', 'Space', 'Alt', 'Ctrl'],
+                'start_x': 20,
+                'y': 220,
+                'key_ids': list(range(63, 69)),
+                'widths': [self.base_key_width * 1.2] * 2 + [self.base_key_width] + [self.base_key_width * 5] + [self.base_key_width] + [self.base_key_width * 1.2]
+            },
+            # Arrow keys
+            {
+                'keys': ['↑', '↓', '←', '→'],
+                'start_x': 600,
+                'y': 200,
+                'key_ids': list(range(69, 73)),
+                'widths': [self.base_key_width] * 4,
+                'layout': 'arrow_cluster'
+            }
+        ]
+
+        # Create key objects
+        for row in key_layout:
+            if row.get('layout') == 'arrow_cluster':
+                self._create_arrow_cluster(row)
+            else:
+                self._create_key_row(row)
+
+        # Create additional keys for full 100-key support
+        self._create_additional_keys()
+
+    def _create_key_row(self, row_config):
+        """Create a row of keys"""
+        current_x = row_config['start_x']
+        y = row_config['y']
+
+        for i, (key_label, key_id, width) in enumerate(zip(
+            row_config['keys'],
+            row_config['key_ids'],
+            row_config['widths']
+        )):
+            # Create rounded rectangle for key
+            key_rect = self._create_rounded_rectangle(
+                current_x, y,
+                current_x + width, y + self.base_key_height,
+                radius=self.corner_radius,
+                fill='#404040',
+                outline='#606060',
+                width=2
+            )
+
+            # Create key label
+            key_text = self.canvas.create_text(
+                current_x + width/2, y + self.base_key_height/2,
+                text=key_label,
+                fill='white',
+                font=('Arial', 8, 'bold')
+            )
+
+            # Store key information
+            self.key_objects[key_id] = {
+                'rect': key_rect,
+                'text': key_text,
+                'label': key_label,
+                'x': current_x,
+                'y': y,
+                'width': width,
+                'height': self.base_key_height,
+                'original_color': '#404040'
+            }
+
+            self.key_positions[key_id] = (current_x + width/2, y + self.base_key_height/2)
+
+            # Bind click event
+            self.canvas.tag_bind(key_rect, '<Button-1>',
+                               lambda e, kid=key_id: self._on_key_click(kid))
+            self.canvas.tag_bind(key_text, '<Button-1>',
+                               lambda e, kid=key_id: self._on_key_click(kid))
+
+            current_x += width + self.key_spacing
+
+    def _create_arrow_cluster(self, row_config):
+        """Create arrow key cluster with proper positioning"""
+        base_x = row_config['start_x']
+        base_y = row_config['y']
+
+        # Arrow key positions: up, down, left, right
+        positions = [
+            (base_x + self.base_key_width, base_y - self.base_key_height - self.key_spacing),  # Up
+            (base_x + self.base_key_width, base_y),  # Down
+            (base_x, base_y),  # Left
+            (base_x + 2 * (self.base_key_width + self.key_spacing), base_y)  # Right
+        ]
+
+        for i, (key_label, key_id) in enumerate(zip(row_config['keys'], row_config['key_ids'])):
+            x, y = positions[i]
+
+            key_rect = self._create_rounded_rectangle(
+                x, y, x + self.base_key_width, y + self.base_key_height,
+                radius=self.corner_radius,
+                fill='#404040',
+                outline='#606060',
+                width=2
+            )
+
+            key_text = self.canvas.create_text(
+                x + self.base_key_width/2, y + self.base_key_height/2,
+                text=key_label,
+                fill='white',
+                font=('Arial', 10, 'bold')
+            )
+
+            self.key_objects[key_id] = {
+                'rect': key_rect,
+                'text': key_text,
+                'label': key_label,
+                'x': x,
+                'y': y,
+                'width': self.base_key_width,
+                'height': self.base_key_height,
+                'original_color': '#404040'
+            }
+
+            self.key_positions[key_id] = (x + self.base_key_width/2, y + self.base_key_height/2)
+
+            self.canvas.tag_bind(key_rect, '<Button-1>',
+                               lambda e, kid=key_id: self._on_key_click(kid))
+            self.canvas.tag_bind(key_text, '<Button-1>',
+                               lambda e, kid=key_id: self._on_key_click(kid))
+
+    def _create_additional_keys(self):
+        """Create additional keys to reach full 100-key capacity"""
+        # Add remaining keys in a separate area
+        start_x = 20
+        start_y = 270
+        current_x = start_x
+        current_y = start_y
+
+        for key_id in range(73, OSIRIS_KEY_COUNT):
+            if current_x > 600:  # Wrap to next row
+                current_x = start_x
+                current_y += self.base_key_height + self.key_spacing
+
+            key_rect = self._create_rounded_rectangle(
+                current_x, current_y,
+                current_x + self.base_key_width, current_y + self.base_key_height,
+                radius=self.corner_radius,
+                fill='#404040',
+                outline='#606060',
+                width=2
+            )
+
+            key_text = self.canvas.create_text(
+                current_x + self.base_key_width/2, current_y + self.base_key_height/2,
+                text=str(key_id),
+                fill='white',
+                font=('Arial', 7)
+            )
+
+            self.key_objects[key_id] = {
+                'rect': key_rect,
+                'text': key_text,
+                'label': str(key_id),
+                'x': current_x,
+                'y': current_y,
+                'width': self.base_key_width,
+                'height': self.base_key_height,
+                'original_color': '#404040'
+            }
+
+            self.key_positions[key_id] = (current_x + self.base_key_width/2, current_y + self.base_key_height/2)
+
+            self.canvas.tag_bind(key_rect, '<Button-1>',
+                               lambda e, kid=key_id: self._on_key_click(kid))
+            self.canvas.tag_bind(key_text, '<Button-1>',
+                               lambda e, kid=key_id: self._on_key_click(kid))
+
+            current_x += self.base_key_width + self.key_spacing
+
+    def _create_rounded_rectangle(self, x1, y1, x2, y2, radius=5, **kwargs):
+        """Create rounded rectangle on canvas"""
+        # For simplicity, create regular rectangle
+        # In a full implementation, this would create actual rounded corners
+        return self.canvas.create_rectangle(x1, y1, x2, y2, **kwargs)
+
+    def _on_key_click(self, key_id):
+        """Handle key click event"""
+        if hasattr(self.controller, 'on_key_click'):
+            # Create mock event with key_id
+            class MockEvent:
+                def __init__(self, key_id):
+                    self.key_id = key_id
+
+            self.controller.selected_key_id = key_id
+            if key_id in self.key_objects:
+                key_info = self.key_objects[key_id]
+                self.controller.selected_key_label.configure(text=key_info['label'])
+                self.controller.selected_color_button.configure(state=tk.NORMAL)
+
+                # Highlight selected key
+                self.canvas.itemconfig(key_info['rect'], outline='#00FF00', width=3)
+
+                # Remove highlight from other keys
+                for other_id, other_info in self.key_objects.items():
+                    if other_id != key_id:
+                        self.canvas.itemconfig(other_info['rect'], outline='#606060', width=2)
+
+    def update_key_colors(self, colors: List[RGBColor]):
+        """Update visual key colors"""
+        for key_id, color in enumerate(colors[:OSIRIS_KEY_COUNT]):
+            if key_id in self.key_objects:
+                hex_color = color.to_hex() if isinstance(color, RGBColor) else "#000000"
+                self.canvas.itemconfig(self.key_objects[key_id]['rect'], fill=hex_color)
+
+    def highlight_key(self, key_id: int, color: str = '#FFFF00'):
+        """Highlight specific key"""
+        if key_id in self.key_objects:
+            self.canvas.itemconfig(self.key_objects[key_id]['rect'], outline=color, width=4)
+
+    def clear_highlights(self):
+        """Clear all key highlights"""
+        for key_info in self.key_objects.values():
+            self.canvas.itemconfig(key_info['rect'], outline='#606060', width=2)
+
+
+class AdvancedEffectControls:
+    """Advanced effect parameter controls"""
+
+    def __init__(self, parent_frame: ttk.Frame, controller: RGBController):
+        """Initialize advanced controls"""
+        self.parent_frame = parent_frame
+        self.controller = controller
+        self.controls_frame = None
+        self.parameter_vars = {}
+        self.current_effect = None
+
+        self._create_advanced_frame()
+
+    def _create_advanced_frame(self):
+        """Create advanced controls frame"""
+        self.controls_frame = ttk.LabelFrame(
+            self.parent_frame,
+            text="Advanced Parameters",
+            padding="10"
+        )
+        self.controls_frame.pack(fill=tk.X, pady=10)
+
+        # Initially hidden
+        self.controls_frame.pack_forget()
+
+    def show_effect_parameters(self, effect_name: str):
+        """Show parameters for specific effect"""
+        if effect_name == self.current_effect:
+            return
+
+        self.current_effect = effect_name
+
+        # Clear existing controls
+        for widget in self.controls_frame.winfo_children():
+            widget.destroy()
+
+        self.parameter_vars.clear()
+
+        # Create effect-specific controls
+        if effect_name == "Rainbow Wave":
+            self._create_rainbow_wave_controls()
+        elif effect_name == "Breathing":
+            self._create_breathing_controls()
+        elif effect_name == "Reactive Keypress":
+            self._create_reactive_controls()
+        elif effect_name == "Fire":
+            self._create_fire_controls()
+        elif effect_name == "Ocean":
+            self._create_ocean_controls()
+        elif effect_name == "Audio Visualizer":
+            self._create_audio_visualizer_controls()
+        elif effect_name == "System Load":
+            self._create_system_monitor_controls()
+
+        # Show advanced frame if we have controls
+        if self.parameter_vars:
+            self.controls_frame.pack(fill=tk.X, pady=10)
+        else:
+            self.controls_frame.pack_forget()
+
+    def _create_rainbow_wave_controls(self):
+        """Create Rainbow Wave specific controls"""
+        # Direction control
+        direction_frame = ttk.Frame(self.controls_frame)
+        direction_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(direction_frame, text="Direction:").pack(side=tk.LEFT)
+
+        self.parameter_vars['direction'] = tk.StringVar(value="horizontal")
+        direction_combo = ttk.Combobox(
+            direction_frame,
+            textvariable=self.parameter_vars['direction'],
+            values=["horizontal", "vertical", "diagonal"],
+            state="readonly",
+            width=15
+        )
+        direction_combo.pack(side=tk.LEFT, padx=(5, 0))
+
+        # Wave length control
+        length_frame = ttk.Frame(self.controls_frame)
+        length_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(length_frame, text="Wave Length:").pack(side=tk.LEFT)
+
+        self.parameter_vars['wave_length'] = tk.DoubleVar(value=4.0)
+        length_scale = ttk.Scale(
+            length_frame,
+            from_=1.0, to=10.0,
+            variable=self.parameter_vars['wave_length'],
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        length_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        length_label = ttk.Label(length_frame, text="4.0")
+        length_label.pack(side=tk.LEFT)
+
+        self.parameter_vars['wave_length'].trace('w',
+            lambda *args: length_label.configure(text=f"{self.parameter_vars['wave_length'].get():.1f}"))
+
+ def _create_breathing_controls(self):
+        """Create Breathing effect specific controls"""
+        # Min brightness control
+        min_frame = ttk.Frame(self.controls_frame)
+        min_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(min_frame, text="Min Brightness:").pack(side=tk.LEFT)
+
+        self.parameter_vars['min_brightness'] = tk.DoubleVar(value=0.1)
+        min_scale = ttk.Scale(
+            min_frame,
+            from_=0.0, to=0.5,
+            variable=self.parameter_vars['min_brightness'],
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        min_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        min_label = ttk.Label(min_frame, text="10%")
+        min_label.pack(side=tk.LEFT)
+
+        # Max brightness control
+        max_frame = ttk.Frame(self.controls_frame)
+        max_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(max_frame, text="Max Brightness:").pack(side=tk.LEFT)
+
+        self.parameter_vars['max_brightness'] = tk.DoubleVar(value=1.0)
+        max_scale = ttk.Scale(
+            max_frame,
+            from_=0.5, to=1.0,
+            variable=self.parameter_vars['max_brightness'],
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        max_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        max_label = ttk.Label(max_frame, text="100%")
+        max_label.pack(side=tk.LEFT)
+
+        # Update labels
+        self.parameter_vars['min_brightness'].trace('w',
+            lambda *args: min_label.configure(text=f"{int(self.parameter_vars['min_brightness'].get()*100)}%"))
+        self.parameter_vars['max_brightness'].trace('w',
+            lambda *args: max_label.configure(text=f"{int(self.parameter_vars['max_brightness'].get()*100)}%"))
+
+    def _create_reactive_controls(self):
+        """Create Reactive Keypress specific controls"""
+        # Fade time control
+        fade_frame = ttk.Frame(self.controls_frame)
+        fade_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(fade_frame, text="Fade Time:").pack(side=tk.LEFT)
+
+        self.parameter_vars['fade_time'] = tk.DoubleVar(value=1.0)
+        fade_scale = ttk.Scale(
+            fade_frame,
+            from_=0.2, to=5.0,
+            variable=self.parameter_vars['fade_time'],
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        fade_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        fade_label = ttk.Label(fade_frame, text="1.0s")
+        fade_label.pack(side=tk.LEFT)
+
+        self.parameter_vars['fade_time'].trace('w',
+            lambda *args: fade_label.configure(text=f"{self.parameter_vars['fade_time'].get():.1f}s"))
+
+    def _create_fire_controls(self):
+        """Create Fire effect specific controls"""
+        # Intensity control
+        intensity_frame = ttk.Frame(self.controls_frame)
+        intensity_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(intensity_frame, text="Fire Intensity:").pack(side=tk.LEFT)
+
+        self.parameter_vars['intensity'] = tk.DoubleVar(value=0.8)
+        intensity_scale = ttk.Scale(
+            intensity_frame,
+            from_=0.3, to=1.0,
+            variable=self.parameter_vars['intensity'],
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        intensity_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        intensity_label = ttk.Label(intensity_frame, text="80%")
+        intensity_label.pack(side=tk.LEFT)
+
+        self.parameter_vars['intensity'].trace('w',
+            lambda *args: intensity_label.configure(text=f"{int(self.parameter_vars['intensity'].get()*100)}%"))
+
+    def _create_ocean_controls(self):
+        """Create Ocean effect specific controls"""
+        # Wave speed control
+        wave_frame = ttk.Frame(self.controls_frame)
+        wave_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(wave_frame, text="Wave Speed:").pack(side=tk.LEFT)
+
+        self.parameter_vars['wave_speed'] = tk.DoubleVar(value=1.0)
+        wave_scale = ttk.Scale(
+            wave_frame,
+            from_=0.5, to=3.0,
+            variable=self.parameter_vars['wave_speed'],
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        wave_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        wave_label = ttk.Label(wave_frame, text="1.0x")
+        wave_label.pack(side=tk.LEFT)
+
+        self.parameter_vars['wave_speed'].trace('w',
+            lambda *args: wave_label.configure(text=f"{self.parameter_vars['wave_speed'].get():.1f}x"))
+
+    def _create_audio_visualizer_controls(self):
+        """Create Audio Visualizer specific controls"""
+        # Sensitivity control
+        sens_frame = ttk.Frame(self.controls_frame)
+        sens_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(sens_frame, text="Audio Sensitivity:").pack(side=tk.LEFT)
+
+        self.parameter_vars['sensitivity'] = tk.DoubleVar(value=1.0)
+        sens_scale = ttk.Scale(
+            sens_frame,
+            from_=0.1, to=5.0,
+            variable=self.parameter_vars['sensitivity'],
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        sens_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        sens_label = ttk.Label(sens_frame, text="1.0x")
+        sens_label.pack(side=tk.LEFT)
+
+        self.parameter_vars['sensitivity'].trace('w',
+            lambda *args: sens_label.configure(text=f"{self.parameter_vars['sensitivity'].get():.1f}x"))
+
+        # Audio source selection
+        source_frame = ttk.Frame(self.controls_frame)
+        source_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(source_frame, text="Audio Source:").pack(side=tk.LEFT)
+
+        self.parameter_vars['audio_source'] = tk.StringVar(value="default")
+        source_combo = ttk.Combobox(
+            source_frame,
+            textvariable=self.parameter_vars['audio_source'],
+            values=["default", "microphone", "system"],
+            state="readonly",
+            width=15
+        )
+        source_combo.pack(side=tk.LEFT, padx=(5, 0))
+
+    def _create_system_monitor_controls(self):
+        """Create System Load Monitor specific controls"""
+        # Monitor type selection
+        type_frame = ttk.Frame(self.controls_frame)
+        type_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(type_frame, text="Monitor Type:").pack(side=tk.LEFT)
+
+        self.parameter_vars['monitor_type'] = tk.StringVar(value="cpu")
+        type_combo = ttk.Combobox(
+            type_frame,
+            textvariable=self.parameter_vars['monitor_type'],
+            values=["cpu", "memory", "gpu", "temperature"],
+            state="readonly",
+            width=15
+        )
+        type_combo.pack(side=tk.LEFT, padx=(5, 0))
+
+        # Update interval
+        interval_frame = ttk.Frame(self.controls_frame)
+        interval_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(interval_frame, text="Update Interval:").pack(side=tk.LEFT)
+
+        self.parameter_vars['update_interval'] = tk.DoubleVar(value=1.0)
+        interval_scale = ttk.Scale(
+            interval_frame,
+            from_=0.5, to=5.0,
+            variable=self.parameter_vars['update_interval'],
+            orient=tk.HORIZONTAL,
+            length=200
+        )
+        interval_scale.pack(side=tk.LEFT, padx=(5, 10))
+
+        interval_label = ttk.Label(interval_frame, text="1.0s")
+        interval_label.pack(side=tk.LEFT)
+
+        self.parameter_vars['update_interval'].trace('w',
+            lambda *args: interval_label.configure(text=f"{self.parameter_vars['update_interval'].get():.1f}s"))
+
+    def get_current_parameters(self) -> Dict[str, Any]:
+        """Get current parameter values"""
+        params = {}
+        for name, var in self.parameter_vars.items():
+            try:
+                params[name] = var.get()
+            except Exception:
+                pass
+        return params
+
+
+class PerformanceMonitor:
+    """Performance monitoring and optimization"""
+
+    def __init__(self, controller: RGBController):
+        """Initialize performance monitor"""
+        self.controller = controller
+        self.frame_times = []
+        self.max_samples = 100
+        self.last_update = time.time()
+        self.performance_data = {
+            'fps': 0.0,
+            'avg_frame_time': 0.0,
+            'cpu_usage': 0.0,
+            'memory_usage': 0.0
+        }
+
+        # Performance thresholds
+        self.fps_threshold = 20.0
+        self.frame_time_threshold = 0.05  # 50ms
+
+        self._monitor_thread = None
+        self._stop_monitoring = threading.Event()
+
+    def start_monitoring(self):
+        """Start performance monitoring"""
+        if not self._monitor_thread or not self._monitor_thread.is_alive():
+            self._stop_monitoring.clear()
+            self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+            self._monitor_thread.start()
+
+    def stop_monitoring(self):
+        """Stop performance monitoring"""
+        self._stop_monitoring.set()
+
+    def _monitor_loop(self):
+        """Performance monitoring loop"""
+        try:
+            import psutil
+            process = psutil.Process()
+        except ImportError:
+            process = None
+
+        while not self._stop_monitoring.is_set():
+            try:
+                current_time = time.time()
+
+                # Update system metrics
+                if process:
+                    self.performance_data['cpu_usage'] = process.cpu_percent()
+                    self.performance_data['memory_usage'] = process.memory_info().rss / 1024 / 1024  # MB
+
+                # Check for performance issues
+                if self.performance_data['fps'] < self.fps_threshold:
+                    self._handle_low_performance()
+
+                time.sleep(1.0)  # Update every second
+
+            except Exception as e:
+                self.controller.logger.error(f"Error in performance monitor: {e}")
+                time.sleep(1.0)
+
+    def record_frame_time(self, frame_time: float):
+        """Record frame rendering time"""
+        self.frame_times.append(frame_time)
+
+        if len(self.frame_times) > self.max_samples:
+            self.frame_times.pop(0)
+
+        # Calculate FPS and average frame time
+        if self.frame_times:
+            avg_frame_time = sum(self.frame_times) / len(self.frame_times)
+            self.performance_data['avg_frame_time'] = avg_frame_time
+            self.performance_data['fps'] = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+
+    def _handle_low_performance(self):
+        """Handle low performance scenarios"""
+        if hasattr(self.controller, 'effect_manager') and self.controller.effect_manager:
+            current_effect = self.controller.effect_manager.get_current_effect_name()
+
+            if current_effect in ['Fire', 'Matrix Code', 'Tornado', 'Audio Visualizer']:
+                self.controller.logger.warning("Performance degraded - consider switching to lighter effect")
+
+    def get_performance_stats(self) -> Dict[str, float]:
+        """Get current performance statistics"""
+        return self.performance_data.copy()
+
+
+class KeyboardShortcuts:
+    """Global keyboard shortcuts handler"""
+
+    def __init__(self, controller: RGBController):
+        """Initialize keyboard shortcuts"""
+        self.controller = controller
+        self.shortcuts_enabled = True
+        self.key_listener = None
+
+        # Try to import keyboard library for global shortcuts
+        try:
+            import pynput.keyboard as keyboard
+            self.keyboard = keyboard
+            self.shortcuts_available = True
+        except ImportError:
+            self.keyboard = None
+            self.shortcuts_available = False
+            self.controller.logger.warning("Global shortcuts not available - pynput not installed")
+
+        # Shortcut mappings
+        self.shortcuts = {
+            'ctrl+alt+1': lambda: self._quick_effect('Static Color'),
+            'ctrl+alt+2': lambda: self._quick_effect('Breathing'),
+            'ctrl+alt+3': lambda: self._quick_effect('Rainbow Wave'),
+            'ctrl+alt+4': lambda: self._quick_effect('Reactive Keypress'),
+            'ctrl+alt+0': lambda: self._stop_all_effects(),
+            'ctrl+alt+plus': lambda: self._adjust_brightness(10),
+            'ctrl+alt+minus': lambda: self._adjust_brightness(-10),
+        }
+
+    def enable_shortcuts(self):
+        """Enable global keyboard shortcuts"""
+        if not self.shortcuts_available or self.key_listener:
+            return False
+
+        try:
+            self.key_listener = self.keyboard.GlobalHotKey(
+                self.shortcuts,
+                self._on_hotkey
+            )
+            self.key_listener.start()
+            self.shortcuts_enabled = True
+            return True
+        except Exception as e:
+            self.controller.logger.error(f"Failed to enable shortcuts: {e}")
+            return False
+
+    def disable_shortcuts(self):
+        """Disable global keyboard shortcuts"""
+        if self.key_listener:
+            self.key_listener.stop()
+            self.key_listener = None
+        self.shortcuts_enabled = False
+
+    def _on_hotkey(self):
+        """Handle hotkey press"""
+        pass  # Handled by individual shortcut functions
+
+    def _quick_effect(self, effect_name: str):
+        """Quick effect activation"""
+        try:
+            if self.controller.effect_manager:
+                self.controller.effect_manager.start_effect(effect_name)
+        except Exception as e:
+            self.controller.logger.error(f"Error in quick effect: {e}")
+
+    def _stop_all_effects(self):
+        """Stop all effects"""
+        try:
+            if self.controller.effect_manager:
+                self.controller.effect_manager.stop_effect()
+        except Exception as e:
+            self.controller.logger.error(f"Error stopping effects: {e}")
+
+    def _adjust_brightness(self, delta: int):
+        """Adjust brightness by delta"""
+        try:
+            if hasattr(self.controller, 'brightness_var'):
+                current = self.controller.brightness_var.get()
+                new_brightness = max(0, min(100, current + delta))
+                self.controller.brightness_var.set(new_brightness)
+
+                if self.controller.hardware:
+                    self.controller.hardware.set_brightness(new_brightness)
+        except Exception as e:
+            self.controller.logger.error(f"Error adjusting brightness: {e}")
+
+
+class ConfigurationManager:
+    """Advanced configuration management"""
+
+    def __init__(self, controller: RGBController):
+        """Initialize configuration manager"""
+        self.controller = controller
+        self.config_history = []
+        self.max_history = 20
+
+    def save_configuration(self, name: str, description: str = "") -> bool:
+        """Save current configuration"""
+        try:
+            config = {
+                'name': name,
+                'description': description,
+                'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'version': VERSION,
+                'settings': self.controller.settings.get_all_settings(),
+                'effect': self.controller.current_effect,
+                'parameters': {}
+            }
+
+            # Get current effect parameters
+            if hasattr(self.controller, 'advanced_controls'):
+                config['parameters'] = self.controller.advanced_controls.get_current_parameters()
+
+            # Save to file
+            config_dir = self.controller.settings.CONFIG_DIR / "configurations"
+            config_dir.mkdir(exist_ok=True)
+
+            config_file = config_dir / f"{name}.json"
+            with open(config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+
+            self.controller.logger.info(f"Configuration saved: {name}")
+            return True
+
+        except Exception as e:
+            self.controller.logger.error(f"Failed to save configuration: {e}")
+            return False
+
+    def load_configuration(self, name: str) -> bool:
+        """Load saved configuration"""
+        try:
+            config_dir = self.controller.settings.CONFIG_DIR / "configurations"
+            config_file = config_dir / f"{name}.json"
+
+            if not config_file.exists():
+                return False
+
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+
+            # Apply settings
+            if 'settings' in config:
+                self.controller.settings.update(config['settings'])
+
+            # Apply effect
+            if 'effect' in config and config['effect']:
+                effect_name = config['effect']
+                if hasattr(self.controller, 'effect_var'):
+                    self.controller.effect_var.set(effect_name)
+
+                # Apply parameters
+                params = config.get('parameters', {})
+                if self.controller.effect_manager:
+                    self.controller.effect_manager.start_effect(effect_name, **params)
+
+            self.controller.logger.info(f"Configuration loaded: {name}")
+            return True
+
+        except Exception as e:
+            self.controller.logger.error(f"Failed to load configuration: {e}")
+            return False
+
+    def get_saved_configurations(self) -> List[str]:
+        """Get list of saved configurations"""
+        try:
+            config_dir = self.controller.settings.CONFIG_DIR / "configurations"
+            if not config_dir.exists():
+                return []
+
+            configs = []
+            for config_file in config_dir.glob("*.json"):
+                configs.append(config_file.stem)
+
+            return sorted(configs)
+
+        except Exception as e:
+            self.controller.logger.error(f"Failed to get configurations: {e}")
+            return []
+
+    def delete_configuration(self, name: str) -> bool:
+        """Delete saved configuration"""
+        try:
+            config_dir = self.controller.settings.CONFIG_DIR / "configurations"
+            config_file = config_dir / f"{name}.json"
+
+            if config_file.exists():
+                config_file.unlink()
+                self.controller.logger.info(f"Configuration deleted: {name}")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.controller.logger.error(f"Failed to delete configuration: {e}")
+            return False
+
+
+class UpdateChecker:
+    """Check for application updates"""
+
+    def __init__(self, controller: RGBController):
+        """Initialize update checker"""
+        self.controller = controller
+        self.current_version = VERSION
+        self.check_url = "https://api.github.com/repos/punksm4ck/cb-rgb-keyboard/releases/latest"
+
+    def check_for_updates(self, show_no_update_message: bool = False) -> bool:
+        """Check for available updates"""
+        try:
+            import urllib.request
+            import json
+
+            with urllib.request.urlopen(self.check_url, timeout=10) as response:
+                data = json.loads(response.read().decode())
+
+            latest_version = data.get('tag_name', '').lstrip('v')
+
+            if self._is_newer_version(latest_version, self.current_version):
+                self._show_update_dialog(latest_version, data.get('html_url', ''))
+                return True
+            elif show_no_update_message:
+                messagebox.showinfo("No Updates", "You are running the latest version.")
+
+            return False
+
+        except Exception as e:
+            self.controller.logger.error(f"Failed to check for updates: {e}")
+            if show_no_update_message:
+                messagebox.showerror("Update Check Failed", f"Could not check for updates: {e}")
+            return False
+
+    def _is_newer_version(self, latest: str, current: str) -> bool:
+        """Compare version strings"""
+        try:
+            def version_tuple(v):
+                return tuple(map(int, v.split('-')[0].split('.')))
+
+            return version_tuple(latest) > version_tuple(current)
+        except:
+            return False
+
+    def _show_update_dialog(self, version: str, url: str):
+        """Show update available dialog"""
+        result = messagebox.askyesno(
+            "Update Available",
+            f"A new version ({version}) is available!\n"
+            f"Current version: {self.current_version}\n\n"
+            f"Would you like to visit the download page?"
+        )
+
+        if result:
+            import webbrowser
+            webbrowser.open(url)
+
+
+# Enhanced RGBController class extensions
+def enhance_rgb_controller():
+    """Add enhanced functionality to RGBController"""
+
+    # Add system tray support
+    def add_system_tray(self):
+        """Add system tray functionality"""
+        self.system_tray = SystemTrayIcon(self)
+        if self.settings.get('minimize_to_tray', True):
+            if self.system_tray.create_tray_icon():
+                self.system_tray.show_tray_icon()
+
+    # Add keyboard visualization
+    def add_keyboard_visualization(self):
+        """Add advanced keyboard visualization"""
+        if hasattr(self, 'keyboard_canvas'):
+            self.keyboard_viz = KeyboardLayoutVisualization(self.keyboard_canvas, self)
+
+    # Add advanced controls
+    def add_advanced_controls(self):
+        """Add advanced effect controls"""
+        if hasattr(self, 'effects_tab'):
+            self.advanced_controls = AdvancedEffectControls(self.effects_tab, self)
+
+    # Add performance monitoring
+    def add_performance_monitoring(self):
+        """Add performance monitoring"""
+        self.performance_monitor = PerformanceMonitor(self)
+        if self.settings.get('enable_performance_monitoring', True):
+            self.performance_monitor.start_monitoring()
+
+    # Add keyboard shortcuts
+    def add_keyboard_shortcuts(self):
+        """Add global keyboard shortcuts"""
+        self.shortcuts = KeyboardShortcuts(self)
+        if self.settings.get('enable_global_shortcuts', True):
+            self.shortcuts.enable_shortcuts()
+
+    # Add configuration management
+    def add_configuration_management(self):
+        """Add configuration management"""
+        self.config_manager = ConfigurationManager(self)
+
+    # Add update checker
+    def add_update_checker(self):
+        """Add update checking functionality"""
+        self.update_checker = UpdateChecker(self)
+
+        # Check for updates on startup if enabled
+        if self.settings.get('check_for_updates', True):
+            threading.Timer(5.0, lambda: self.update_checker.check_for_updates()).start()
+
+    # Enhanced cleanup
+    def enhanced_cleanup(self):
+        """Enhanced cleanup with all components"""
+        try:
+            # Stop performance monitoring
+            if hasattr(self, 'performance_monitor'):
+                self.performance_monitor.stop_monitoring()
+
+            # Disable shortcuts
+            if hasattr(self, 'shortcuts'):
+                self.shortcuts.disable_shortcuts()
+
+            # Hide system tray
+            if hasattr(self, 'system_tray'):
+                self.system_tray.hide_tray_icon()
+
+            # Call original cleanup
+            self.cleanup()
+
+        except Exception as e:
+            self.logger.error(f"Error in enhanced cleanup: {e}")
+
+    # Add methods to RGBController class
+    RGBController.add_system_tray = add_system_tray
+    RGBController.add_keyboard_visualization = add_keyboard_visualization
+    RGBController.add_advanced_controls = add_advanced_controls
+    RGBController.add_performance_monitoring = add_performance_monitoring
+    RGBController.add_keyboard_shortcuts = add_keyboard_shortcuts
+    RGBController.add_configuration_management = add_configuration_management
+    RGBController.add_update_checker = add_update_checker
+    RGBController.enhanced_cleanup = enhanced_cleanup
+
+
+# Apply enhancements
+enhance_rgb_controller()
+
+
+# Main application entry point with full feature set
+def main():
+    """Main application entry point with enhanced features"""
+    try:
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        logger = logging.getLogger('RGBController')
+
+        # Initialize settings
+        settings = SettingsManager()
+
+        # Create controller
+        controller = RGBController(settings, logger)
+
+        # Initialize GUI
+        if not controller.initialize_gui():
+            logger.error("Failed to initialize GUI")
+            return 1
+
+        # Add enhanced features
+        controller.add_system_tray()
+        controller.add_keyboard_visualization()
+        controller.add_advanced_controls()
+        controller.add_performance_monitoring()
+        controller.add_keyboard_shortcuts()
+        controller.add_configuration_management()
+        controller.add_update_checker()
+
+        # Run application
+        controller.run()
+
+        return 0
+
+    except Exception as e:
+        logging.error(f"Fatal error in main application: {e}")
+        return 1
+
+    finally:
+        if 'controller' in locals():
+            controller.enhanced_cleanup()
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
